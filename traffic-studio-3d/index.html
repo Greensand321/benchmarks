@@ -5311,32 +5311,39 @@ function buildStopBarTints(){
     const p = posOnSpine(link.spine, link.len - 0.5);
     const tl = Math.hypot(p.tx, p.ty) || 1, dx = p.tx / tl, dy = p.ty / tl;
     const nl = link.lanes.length;
-    /* one bar per lane, lit by the movements that lane serves, so a
-       protected left arrow shows on the left-turn lane alone */
+    /* A bar per lane and movement, lit by that movement's signal, so
+       a protected left arrow shows on the left-turn lane alone.  A
+       lane shared by lefts and through traffic is split: its left
+       half follows the arrow, its right half the through head. */
     for (const lane of link.lanes){
-      const groups = [...new Set(lane.out.map(c => c.group))];
+      const groups = [...new Set(lane.out.map(c => c.group))]
+        .sort((a, b) => (b.endsWith('Left') ? 1 : 0) - (a.endsWith('Left') ? 1 : 0));
       if (!groups.length) continue;
-      const u0 = (nl - lane.index - 1) * LANE_W, u1 = u0 + LANE_W;
-      const a0 = u0 + (lane.index === nl - 1 ? 0.12 : 0.06), a1 = u1 - (lane.index === 0 ? 0.08 : 0.06);
-      const b0 = bar.n;
-      bandQuad(bar, p.x + p.nx * a0, p.y + p.ny * a0, p.x + p.nx * a1, p.y + p.ny * a1, 0.28, MARK_Y + 0.004, SIG_COL.red);
-      /* halo: bright along the bar, black (= nothing, additively) at its rim */
-      const g0 = glow.n;
-      const ax = p.x + p.nx * u0, ay = p.y + p.ny * u0, bx = p.x + p.nx * u1, by = p.y + p.ny * u1;
-      const H = 1.1, gy = MARK_Y + 0.006;
-      const pts = [
-        [ax - dx * H, ay - dy * H, black], [bx - dx * H, by - dy * H, black],
-        [ax, ay, SIG_COL.red],             [bx, by, SIG_COL.red],
-        [ax + dx * H, ay + dy * H, black], [bx + dx * H, by + dy * H, black],
-      ];
-      const idx = pts.map(q => glow.v(q[0], gy, q[1], 0, 1, 0, 0, 0, q[2]));
-      const quad = (a, b, c, d) => {
-        if (cross2({ x: pts[a][0], y: pts[a][1] }, { x: pts[b][0], y: pts[b][1] }, { x: pts[c][0], y: pts[c][1] }) < 0){
-          glow.t(idx[a], idx[b], idx[c]); glow.t(idx[a], idx[c], idx[d]);
-        } else { glow.t(idx[a], idx[c], idx[b]); glow.t(idx[a], idx[d], idx[c]); }
-      };
-      quad(0, 1, 3, 2); quad(2, 3, 5, 4);
-      TINT.list.push({ node: link.to, groups, b0, b1: bar.n, g0, st: '' });
+      const l0 = (nl - lane.index - 1) * LANE_W;
+      const k0 = l0 + (lane.index === nl - 1 ? 0.12 : 0.06), k1 = l0 + LANE_W - (lane.index === 0 ? 0.08 : 0.06);
+      groups.forEach((grp, gi) => {
+        const u0 = l0 + LANE_W * gi / groups.length, u1 = l0 + LANE_W * (gi + 1) / groups.length;
+        const a0 = gi === 0 ? k0 : u0, a1 = gi === groups.length - 1 ? k1 : u1;
+        const b0 = bar.n;
+        bandQuad(bar, p.x + p.nx * a0, p.y + p.ny * a0, p.x + p.nx * a1, p.y + p.ny * a1, 0.28, MARK_Y + 0.004, SIG_COL.red);
+        /* halo: bright along the bar, black (= nothing, additively) at its rim */
+        const g0 = glow.n;
+        const ax = p.x + p.nx * u0, ay = p.y + p.ny * u0, bx = p.x + p.nx * u1, by = p.y + p.ny * u1;
+        const H = 1.1, gy = MARK_Y + 0.006;
+        const pts = [
+          [ax - dx * H, ay - dy * H, black], [bx - dx * H, by - dy * H, black],
+          [ax, ay, SIG_COL.red],             [bx, by, SIG_COL.red],
+          [ax + dx * H, ay + dy * H, black], [bx + dx * H, by + dy * H, black],
+        ];
+        const idx = pts.map(q => glow.v(q[0], gy, q[1], 0, 1, 0, 0, 0, q[2]));
+        const quad = (a, b, c, d) => {
+          if (cross2({ x: pts[a][0], y: pts[a][1] }, { x: pts[b][0], y: pts[b][1] }, { x: pts[c][0], y: pts[c][1] }) < 0){
+            glow.t(idx[a], idx[b], idx[c]); glow.t(idx[a], idx[c], idx[d]);
+          } else { glow.t(idx[a], idx[c], idx[b]); glow.t(idx[a], idx[d], idx[c]); }
+        };
+        quad(0, 1, 3, 2); quad(2, 3, 5, 4);
+        TINT.list.push({ node: link.to, groups: [grp], b0, b1: bar.n, g0, st: '' });
+      });
     }
   }
   TINT.mesh = addMesh(STATIC3D, bar, MAT_TINT, { order: 4 });
