@@ -3473,7 +3473,7 @@ function mergeLeader(v){
    with a fresh claim on it is treated as occupied. */
 function claimedAgainst(v, other){
   const cl = other.claim;
-  return !!cl && cl.v !== v && SIM.t - cl.t < 0.15 && cl.v.seg.kind === 'lane' && SIM.vehicles.includes(cl.v);
+  return !!cl && cl.v !== v && SIM.t - cl.t < 0.15 && cl.v.seg.kind === 'lane';
 }
 
 /* a car from the last phase still short of where it crosses path c:
