@@ -185,7 +185,9 @@ input[type=range]:focus-visible{outline:none}
 input[type=range]:focus-visible::-webkit-slider-thumb{box-shadow:0 0 0 2px var(--blueprint)}
 
 /* toggle — modeled on a cabinet rocker switch */
-.tog{display:flex;align-items:center;justify-content:space-between;gap:10px;cursor:pointer;user-select:none}
+.tog{display:flex;align-items:center;justify-content:space-between;gap:10px;cursor:pointer;user-select:none;
+  position:relative}  /* keeps the hidden checkbox inside the scrolling panel: focusing it
+                         once scrolled the whole page off-screen, leaving it blank */
 .tog span.lb{font-size:11.5px;color:var(--paint-2)}
 .tog input{position:absolute;opacity:0;pointer-events:none}
 .tog .sw{
@@ -7747,6 +7749,19 @@ function bindTog(id, apply){
 }
 
 function setupControls(){
+  /* The console fills the window and never scrolls.  Should focus ever
+     drag the page itself off-screen — a control laid out beyond the
+     fold — put it straight back rather than leave a blank screen that
+     nothing can scroll back. */
+  const pin = () => {
+    if (window.scrollX || window.scrollY) window.scrollTo(0, 0);
+    for (const el of [document.documentElement, document.body, $('app'), $('main')])
+      if (el && (el.scrollTop || el.scrollLeft)){ el.scrollTop = 0; el.scrollLeft = 0; }
+  };
+  window.addEventListener('scroll', pin, { passive: true });
+  document.addEventListener('scroll', e => { if (e.target === document || e.target.id === 'app' || e.target.id === 'main') pin(); }, { capture: true, passive: true });
+  document.addEventListener('focusin', () => requestAnimationFrame(pin));
+
   bindRange('sInflow', v => CFG.inflow = v, v => `${v} veh/h`);
   bindRange('sTruck',  v => CFG.truckPct = v, v => `${v}%`);
   bindRange('sBias',   v => CFG.bias = v, v =>
