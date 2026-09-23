@@ -2750,7 +2750,13 @@ const YEL = 3.2, ALLRED = 1.6, LYEL = 3.0;
 
 function buildPhases(){
   for (const n of NET.nodes){
-    if (n.kind !== 'signal' || n.groups.length < 2){ n.plan_ = null; continue; }
+    /* A junction whose approaches all fall in one group — a main road
+       with a side street that only leads away — has nothing to give
+       turns to.  Left as a signal without a plan it ran permanently
+       green, and its left turns never gave way to oncoming traffic.
+       It is uncontrolled instead, which yields by the priority rules. */
+    if (n.kind === 'signal' && n.groups.length < 2) n.kind = 'plain';
+    if (n.kind !== 'signal'){ n.plan_ = null; continue; }
     n.plan_ = buildNodePlan(n);
   }
   /* keep every controller's phase index in range after a rebuild */
@@ -2876,6 +2882,10 @@ function curPhase(node){
 function groupState(node, group){
   if (node.kind === 'stop')  return 'stop';
   if (node.kind === 'yield') return 'yield';
+  /* an uncontrolled crossing is not a free-for-all: drivers give way
+     by the same rules as at a yield sign, just without the sign
+     (crossing traffic drove through itself before) */
+  if (node.kind === 'plain' && node.deg >= 3) return 'yield';
   if (node.kind !== 'signal' || !node.plan_) return 'green';
   const p = curPhase(node);
   if (!p) return 'red';
@@ -3226,7 +3236,7 @@ function makeVehicle(type, route, dest){
     tSpawn: SIM.t, stopTime: 0, freeTime: 0, dist: 0,
     yieldTime: 0, waitTotal: 0, nextReroute: SIM.t + rr(3, 9),
     stalled: false, emerg: type === 'emerg',
-    courtesyFor: null, wantLane: -1, urgency: 0,
+    courtesyFor: null, wantLane: -1, urgency: 0, yellowFor: null, yellowGo: false,
     trail: [],
   };
   let L = 0;
@@ -3396,17 +3406,115 @@ function stopBefore(v, dist){
   return k;
 }
 
+/* What lies further along the route.  The approach logic only looks
+   to the end of the current lane, so where a skewed crossing puts two
+   junctions a few metres apart a car reached the second one too fast:
+   it could neither stop for that signal's red, which it ran, nor slow
+   for the turn beyond it.  Walk the route ahead and brake for each
+   curve and for any stop line past the first (the first is mayEnter's
+   to judge). */
+function lookAhead(v){
+  let acc = 99;
+  const reach = Math.max(62, v.v * v.v / 3 + 12);
+  let seg = v.seg, ri = v.ri, d = seg.len - v.s;
+  for (let k = 0; k < 8 && d < reach; k++){
+    if (seg.kind === 'conn'){ seg = seg.to; ri++; d += seg.len; continue; }
+    const nl = v.route[ri + 1];
+    if (!nl) break;
+    let c = connectorFor(seg, nl);
+    if (!c) for (const l of seg.link.lanes) if ((c = connectorFor(l, nl))) break;
+    if (!c) break;
+    if (seg !== v.seg){
+      const st = groupState(seg.link.to, c.group);
+      if (st === 'red' || st === 'stop' ||
+          (st === 'yellow' && d > v.v * v.v / (2 * v.bMax * frictionFactor()) + 1.5))
+        return Math.min(acc, stopBefore(v, d - 0.4));
+    }
+    if (c.radius < 900){
+      /* keep speed and brake comfortably late, rather than creep down
+         from the moment the curve comes into range — on a roundabout
+         that slowed the whole ring for an exit two junctions away */
+      const vt = Math.max(V_TURN_MIN, Math.sqrt(A_LAT * c.radius * frictionFactor()));
+      const vAllow = Math.sqrt(vt * vt + 2 * 1.6 * frictionFactor() * Math.max(d, 0));
+      if (v.v > vAllow - 0.5) acc = Math.min(acc, (vAllow - v.v) / 0.8);
+    }
+    seg = c; d += c.len;
+  }
+  return acc;
+}
+
+/* Two paths through a junction that end in the same lane: whichever
+   car is nearer the merge goes first and the other falls in behind,
+   rather than both arriving at once and landing on top of each
+   other. */
+function mergeLeader(v){
+  const c = v.seg, toEnd = c.len - v.s;
+  let best = null;
+  for (const cf of c.conflicts){
+    if (!cf.merge) continue;
+    const B = cf.c;
+    for (const w of B.vehicles){
+      const wEnd = B.len - w.s;
+      if (wEnd > toEnd || (wEnd === toEnd && w.id > v.id)) continue;
+      const gap = toEnd - wEnd - w.len;
+      if (!best || gap < best.gap) best = { veh: w, gap };
+    }
+  }
+  return best;
+}
+
 /* ------------------------------------------------------------
    Can this vehicle enter the intersection on connector `c`?
    ------------------------------------------------------------ */
+/* Two cars stopped on crossing approaches both waited their second,
+   both found the junction empty and both set off on the same step:
+   the conflict test only sees cars already inside.  A car about to
+   cross the line claims its path for the moment, and a crossing path
+   with a fresh claim on it is treated as occupied. */
+function claimedAgainst(v, other){
+  const cl = other.claim;
+  return !!cl && cl.v !== v && SIM.t - cl.t < 0.15 && cl.v.seg.kind === 'lane' && SIM.vehicles.includes(cl.v);
+}
+
+/* a car from the last phase still short of where it crosses path c:
+   a fresh green does not entitle anyone to drive into it */
+function crossingOccupied(c){
+  for (const cf of c.conflicts){
+    if (cf.merge) continue;
+    for (const w of cf.c.vehicles) if (w.s < cf.so + 1) return true;
+  }
+  return false;
+}
+
+/* will the stop line at the far end of connector c's exit hold v? */
+function exitHeld(v, c){
+  const after = v.route[v.ri + 2], node = c.to.link.to;
+  if (!after || (node.kind !== 'signal' && node.kind !== 'stop')) return false;
+  let c2 = connectorFor(c.to, after);
+  if (!c2) for (const l of c.to.link.lanes) if ((c2 = connectorFor(l, after))) break;
+  if (!c2) return false;
+  const st = groupState(node, c2.group);
+  return st === 'red' || st === 'yellow' || st === 'stop';
+}
+
 function mayEnter(v, c, dist){
   const node = c.node;
   const st = groupState(node, c.group);
   const perm = groupPermissive(node, c.group);
+  if (st !== 'yellow') v.yellowFor = null;
 
   if (v.emerg && CFG.preempt){
     const ctl = node.ctl;
-    if (ctl){ ctl.preemptGroup = c.inLink.groupIdx; ctl.preemptMove = c.group; ctl.preemptUntil = SIM.t + 5; }
+    if (ctl){
+      /* Serve whoever is at the front of the ambulance's lane, so the
+         queue ahead of it clears first.  Holding the ambulance's own
+         movement left it stuck behind a car that needed another one —
+         a left arrow held for ever over a car waiting to go straight. */
+      let head = v;
+      for (const w of v.seg.vehicles) if (w.s > head.s) head = w;
+      const mc = (head !== v && connectorFor(v.seg, head.route[head.ri + 1])) || c;
+      ctl.preemptGroup = mc.inLink.groupIdx; ctl.preemptMove = mc.group; ctl.preemptUntil = SIM.t + 5;
+    }
   }
 
   const impatient = v.yieldTime > 9;
@@ -3416,6 +3524,7 @@ function mayEnter(v, c, dist){
     if (st === 'stop' && v.yieldTime < 1.0 && v.v > 0.6) return false;
     for (const cf of c.conflicts){
       for (const w of cf.c.vehicles) if (w.s < cf.so + 4) return false;
+      if (!cf.merge && claimedAgainst(v, cf.c)) return false;   // merges sort themselves out
     }
     const myB = Math.atan2(c.inLink.endDir.y, c.inLink.endDir.x);
     const mine = c.inLink.straightness;
@@ -3427,8 +3536,12 @@ function mayEnter(v, c, dist){
       const theirs = other.straightness;
       const major = theirs < mine - 0.12;
       const equalLeft = Math.abs(theirs - mine) <= 0.12 && rel > 0.5 && rel < 2.55;
-      if (!major && !equalLeft) continue;
-      if (Math.abs(rel) > 2.44 && c.turn !== 'L') continue;   // directly opposing, not crossing
+      const opposing = Math.abs(rel) > 2.44;
+      /* a left turn crosses the oncoming stream and gives way to it;
+         the opposing test used to come after the equal-standing one
+         had already skipped oncoming traffic, so it never did */
+      if (!major && !equalLeft && !(opposing && c.turn === 'L' && theirs <= mine + 0.12)) continue;
+      if (opposing && c.turn !== 'L') continue;               // directly opposing, not crossing
       for (const lane of other.lanes)
         for (const w of lane.vehicles){
           const d = lane.len - w.s;
@@ -3443,15 +3556,21 @@ function mayEnter(v, c, dist){
     const rtor = CFG.rtor && c.turn === 'R' && v.v < 1.2 && v.yieldTime > 1.1;
     if (!(rtor || (v.emerg && v.v < 3 && v.yieldTime > 1.4))) return false;
   } else if (st === 'yellow'){
-    /* past the point of no return — clearing is safer than an impossible stop */
-    const stopDist = v.v * v.v / (2 * v.bMax * frictionFactor());
-    if (dist > stopDist + 1.5) return false;
-    return true;                                  // committed, clear the box
+    /* Past the point of no return clearing is safer than an impossible
+       stop — but the call is made once, when the yellow first shows.
+       Re-judged every step, a car slowing for the line came within the
+       margin at walking pace, changed its mind and went, entering on
+       red. */
+    if (v.yellowFor !== c){
+      const stopDist = v.v * v.v / (2 * v.bMax * frictionFactor());
+      v.yellowFor = c; v.yellowGo = dist <= stopDist + 1.5;
+    }
+    return v.yellowGo;
   }
 
   /* on green, a vehicle too close to stop is committed */
   const stopDist = v.v * v.v / (2 * v.bMax * frictionFactor()) + 1.2;
-  if (st === 'green' && v.v > 5 && dist < stopDist * 0.6) return true;
+  if (st === 'green' && v.v > 5 && dist < stopDist * 0.6 && !crossingOccupied(c)) return true;
 
   /* the mouth of the box is still occupied */
   let firstC = null;
@@ -3470,6 +3589,14 @@ function mayEnter(v, c, dist){
   if (CFG.blockBox && !v.emerg){
     const first = c.to.vehicles[0];              // kept sorted by position
     if (first && first.v < 1.6 && first.s - first.len < v.len + 2.2) return false;
+    /* A short exit that ends at a red: a car that will have to stop
+       there must fit on it, or it halts across this junction and
+       blocks the crossing traffic.  (An exit too short ever to hold
+       it is let be — waiting would never end.) */
+    if (c.to.len - 0.4 >= v.len + 1.5){
+      const room = first ? first.s - first.len : c.to.len - 0.4;
+      if (room < v.len + 1.5 && exitHeld(v, c)) return false;
+    }
   }
 
   /* pedestrians in the departure crosswalk */
@@ -3533,7 +3660,11 @@ function planVehicle(v, dt){
   const v0 = desiredSpeed(v);
   let acc = idm(v, 1e5, 0, v0);
 
-  const lead = findLeader(v);
+  let lead = findLeader(v);
+  if (v.seg.kind === 'conn'){
+    const m = mergeLeader(v);
+    if (m && (!lead || m.gap < lead.gap)) lead = m;
+  }
   if (lead) acc = Math.min(acc, idm(v, lead.gap, v.v - lead.veh.v, v0));
 
   /* courtesy: let a signalling merger in */
@@ -3568,6 +3699,7 @@ function planVehicle(v, dt){
         }
         if (dist < 62){
           const ok = mayEnter(v, c, dist);
+          if (ok && c.node.kind !== 'signal' && dist < 1.5 + v.v * 1.2) c.claim = { v, t: SIM.t };
           if (!ok){
             acc = Math.min(acc, stopBefore(v, dist - 0.4));
             if (v.v < 2) v.yieldTime += dt;
@@ -3583,10 +3715,17 @@ function planVehicle(v, dt){
     if (v.v > vt) acc = Math.min(acc, -1.2);
   }
 
-  /* pull over for an emergency vehicle closing from behind */
-  if (!v.emerg && v.seg.kind === 'lane'){
+  acc = Math.min(acc, lookAhead(v));
+
+  /* Make way for an emergency vehicle closing from behind by moving
+     over a lane.  This used to brake instead, in the ambulance's own
+     lane: the car stopped dead in its path and, with the ambulance
+     now held within range behind it, never moved again — most
+     ambulances never finished a trip. */
+  v.wantLane = -1;
+  if (!v.emerg && v.seg.kind === 'lane' && v.seg.link.lanes.length > 1){
     for (const w of v.seg.vehicles){
-      if (w.emerg && w.s < v.s && v.s - w.s < 70){ acc = Math.min(acc, -0.9); v.urgency = 1; v.wantLane = 0; }
+      if (w.emerg && w.s < v.s && v.s - w.s < 70){ v.wantLane = v.seg.index > 0 ? v.seg.index - 1 : 1; break; }
     }
   }
 
@@ -3647,6 +3786,9 @@ function tryLaneChange(v){
     if (best){ want = best; urgency = 0.12; }
   }
 
+  /* an ambulance behind: move over unless the route already moves us */
+  if (!want && v.wantLane >= 0 && v.wantLane < n){ want = Math.sign(v.wantLane - lane.index); urgency = 0.8; }
+
   v.urgency = urgency;
   if (!want) { v.blinker = 0; return; }
 
@@ -3660,11 +3802,25 @@ function tryLaneChange(v){
   const needF = Math.max(2.4, Math.max(2.4, v.v * 0.55) * relax);
   const needB = Math.max(2.6, Math.max(2.6, (nb.behind ? nb.behind.v : 0) * 0.55) * relax);
   const gapF = nb.ahead ? nb.ahead.s - nb.ahead.len - v.s : 999;
-  const gapB = nb.behind ? v.s - v.len - nb.behind.s : 999;
+  let gapB = nb.behind ? v.s - v.len - nb.behind.s : 999;
 
   if (nb.behind) nb.behind.courtesyFor = v;
 
-  if (gapF < needF || gapB < needB) return;
+  /* a car about to leave the junction onto the target lane is not on
+     it yet, but will be in a moment: near the start of the lane, keep
+     clear of it too */
+  let comingB = false;
+  if (!nb.behind && v.s < 30){
+    for (const c of link.from.conns){
+      if (c.to !== tgt) continue;
+      for (const w of c.vehicles){
+        const g = v.s - v.len + (c.len - w.s);
+        if (g < gapB){ gapB = g; comingB = g < Math.max(2.6, w.v * 0.55 * relax); }
+      }
+    }
+  }
+
+  if (gapF < needF || gapB < needB || comingB) return;
   if (nb.ahead && nb.ahead.stalled && gapF < 25) return;
 
   removeFromSeg(v);
@@ -3794,8 +3950,13 @@ function trySpawn(){
     }
     if (!bestLane || bestRoom < veh.len + 7){ SIM.spawnBlocked++; return false; }
 
-    veh.v = Math.min(link.speed / KMH * 0.85, bestRoom * 0.35);
-    addToSeg(veh, bestLane, veh.len + 0.5);
+    /* A portal a few metres from a signal used to launch cars at
+       road speed straight through its red; start no faster than the
+       car can stop in before the end of its lane, and never past it. */
+    const at = Math.min(veh.len + 0.5, Math.max(0.5, bestLane.len - 0.6));
+    const vStop = Math.sqrt(2 * 2.2 * frictionFactor() * Math.max(0, bestLane.len - at - 1));
+    veh.v = Math.min(link.speed / KMH * 0.85, bestRoom * 0.35, vStop);
+    addToSeg(veh, bestLane, at);
     SIM.vehicles.push(veh);
     return true;
   }
