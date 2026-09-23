@@ -7951,8 +7951,11 @@ function setupPointer(){
   window.addEventListener('keydown', e => {
     const tag = e.target.tagName;
     if (tag === 'SELECT' || tag === 'TEXTAREA' || e.target.isContentEditable) return;
-    if (tag === 'INPUT' && e.target.type !== 'checkbox') return;
     const k = e.key.toLowerCase();
+    /* a focused slider keeps the keys that move it; the rest of the
+       shortcuts still work after a slider has been dragged */
+    if (tag === 'INPUT' && e.target.type !== 'checkbox'
+        && (e.target.type !== 'range' || /^(arrow|home|end|page)/.test(k))) return;
     if (k === ' '){ e.preventDefault(); setRunning(!SIM.running); }
     else if (k === '.'){ setRunning(false); for (let i = 0; i < 20; i++) stepSim(0.05); }
     else if (k === '1') setTool('select');
@@ -8006,6 +8009,15 @@ function keyPan(dt){
 }
 
 /* mid-drag, undo means "put it back as it was" */
+/* One undo step per slider gesture, dragged or keyed: the snapshot is
+   taken as the first change arrives, so a click that changes nothing
+   leaves the history alone. */
+function undoableSlider(el){
+  let armed = false;
+  el.addEventListener('input', () => { if (!armed){ snapshot(); armed = true; } });
+  el.addEventListener('change', () => { armed = false; });
+}
+
 function doUndo(){ if ((ED.dragNode || ED.dragCurve) && editorAbort()) return; ED.draw = null; if (!undo()) toast('Nothing to undo'); }
 function doRedo(){ editorAbort(); ED.draw = null; if (!redo()) toast('Nothing to redo'); }
 
@@ -8206,6 +8218,7 @@ function paintCharts(){
     const live = (id, key, fmt) => {
       const el = $(id);
       const lab = el.parentElement.querySelector('.val');
+      undoableSlider(el);
       el.addEventListener('input', () => {
         const val = parseFloat(el.value);
         lab.textContent = fmt(val);
@@ -8215,14 +8228,13 @@ function paintCharts(){
         if (pe.lanesF === 0 && pe.lanesB === 0){ pe.lanesF = 1; }
         scheduleRecompile('prop');
       });
-      el.addEventListener('pointerdown', () => snapshot());
     };
     live('ivLF', 'lanesF', v => v);
     live('ivLB', 'lanesB', v => v);
     live('ivSpd', 'speed', v => v + ' km/h');
 
     const cv2 = $('ivCurve');
-    cv2.addEventListener('pointerdown', () => snapshot());
+    undoableSlider(cv2);
     cv2.addEventListener('change', () => {
       /* once the slider settles, a bend swung across another road
          becomes a junction there */
@@ -8294,7 +8306,7 @@ function paintCharts(){
   if ($('ivPortal')) $('ivPortal').addEventListener('change', ev => setNodeProp(n.id, 'portal', ev.target.value));
   if ($('ivWt')){
     const w = $('ivWt');
-    w.addEventListener('pointerdown', () => snapshot());
+    undoableSlider(w);
     w.addEventListener('input', () => {
       n.plan.weight = parseFloat(w.value);
       w.parentElement.querySelector('.val').textContent = parseFloat(w.value).toFixed(1) + '×';
