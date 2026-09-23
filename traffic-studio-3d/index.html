@@ -8779,13 +8779,23 @@ let acc = 0, lastT = 0, fpsAcc = 0, fpsN = 0, statTimer = 0, histTimer = 0, vmsT
 /* One bad frame must not be able to freeze the whole console:
    requestAnimationFrame is re-armed before any work happens, and
    a throw is reported once rather than silently killing the loop. */
-let frameFaults = 0;
+let frameFaults = 0, faultNoticeAt = -1e9;
 function frame(now){
   requestAnimationFrame(frame);
   try { frameBody(now); }
   catch (err){
     frameFaults++;
-    if (frameFaults === 1){
+    /* A fault usually comes from something that has just gone stale —
+       a selected road deleted, a followed car removed — and would
+       recur identically every frame, leaving the view frozen.  Drop
+       that transient state so the next frame can draw again. */
+    try {
+      SIM.selected = null; SIM.follow = false; CAM.chase = false;
+      ED.hoverNode = null; ED.hoverEdge = null;
+      renderInspector();
+    } catch (e) {}
+    if (now - faultNoticeAt > 8000){
+      faultNoticeAt = now;
       console.error('Render fault:', err);
       try { toast('A rendering fault was caught — see the console'); } catch (e) {}
     }
