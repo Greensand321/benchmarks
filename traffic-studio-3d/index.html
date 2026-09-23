@@ -3373,6 +3373,29 @@ function decelTo(v, target, dist){
   return (target * target - v.v * v.v) / (2 * dist);
 }
 
+/* The acceleration allowed a car that must come to rest `dist`
+   metres ahead, at a stop line or the end of its lane.
+
+   Capping by the exact stopping deceleration alone misbehaved at
+   both ends.  At the line, a car at rest was allowed anything (it
+   needed no braking), so it hopped forward a few millimetres every
+   other step and, after fifteen seconds or so, rolled into the box
+   on red — nearly a third of all junction entries were red runs.
+   Well short of the line, a car barely moving needs almost no
+   braking, which also permits no acceleration: one stopped short
+   crept up at a walking pace for minutes, and one left a hair above
+   zero never moved again, stranding cars that were waiting to change
+   lane.  Now a car holds at the line even from rest, closes up at a
+   crawl when well short of it, and brakes exactly as before once it
+   is moving. */
+const CREEP_V = 2.5, CREEP_A = 0.6;
+function stopBefore(v, dist){
+  if (dist <= 0.3) return -8;
+  const k = v.v > 0 ? -v.v * v.v / (2 * dist) : 0;
+  if (dist > 3 && v.v < CREEP_V) return Math.max(k, CREEP_A * (1 - v.v / CREEP_V));
+  return k;
+}
+
 /* ------------------------------------------------------------
    Can this vehicle enter the intersection on connector `c`?
    ------------------------------------------------------------ */
@@ -3535,7 +3558,7 @@ function planVehicle(v, dt){
          road, or it will abandon every turn it ever planned. */
       if (!c && dist < 7) c = divertVehicle(v);
       if (!c){
-        acc = Math.min(acc, decelTo(v, 0, dist - 0.6));
+        acc = Math.min(acc, stopBefore(v, dist - 0.6));
         v.yieldTime += dt;
       } else {
         /* slow for the turn geometry */
@@ -3546,7 +3569,7 @@ function planVehicle(v, dt){
         if (dist < 62){
           const ok = mayEnter(v, c, dist);
           if (!ok){
-            acc = Math.min(acc, decelTo(v, 0, dist - 0.4));
+            acc = Math.min(acc, stopBefore(v, dist - 0.4));
             if (v.v < 2) v.yieldTime += dt;
           } else {
             v.yieldTime = 0;
