@@ -7220,6 +7220,22 @@ function draftProblem(d){
    the pointer actually is, not at the centre of the view */
 function pickTol(w, px){ return px / Math.max(0.05, pxPerMetre(w.x, w.y)); }
 
+/* A drag takes its undo snapshot as it starts.  If it ends having
+   changed nothing, or is abandoned, the snapshot is withdrawn and
+   the redo list the snapshot cleared is put back. */
+function gestureBegin(){
+  const future = HIST.future.slice();
+  snapshot();
+  return future;
+}
+function gestureEnd(g, restore){
+  const snap = HIST.past.pop();
+  if (restore && snap){ planFromJSON(JSON.parse(snap)); invalidateCompileCache(); recompile('cancel'); }
+  HIST.future.length = 0;
+  HIST.future.push(...g.future);
+  paintHistoryButtons();
+}
+
 function editorDown(w, ev){
   const tolN = pickTol(w, 11), tolE = pickTol(w, 7);
 
@@ -7241,15 +7257,14 @@ function editorDown(w, ev){
 
   if (SIM.tool === 'move'){
     const n = hitPlanNode(w.x, w.y, tolN);
-    if (n){ snapshot(); ED.dragNode = { id: n.id, ox: n.x - w.x, oy: n.y - w.y, moved: false }; return true; }
+    if (n){ ED.dragNode = { id: n.id, ox: n.x - w.x, oy: n.y - w.y, moved: false, future: gestureBegin() }; return true; }
     return false;
   }
 
   if (SIM.tool === 'curve'){
     const e = hitPlanEdge(w.x, w.y, pickTol(w, 12));
     if (e){
-      snapshot();
-      ED.dragCurve = { id: e.edge.id };
+      ED.dragCurve = { id: e.edge.id, moved: false, future: gestureBegin() };
       SIM.selected = { kind: 'edge', ref: e.edge };
       renderInspector();
       return true;
@@ -7330,7 +7345,7 @@ function editorMove(w, ev){
     let h = (w.x - cx) * nx + (w.y - cy) * ny;
     let bulge = clamp(2 * h / c, -1.35, 1.35);
     if (Math.abs(bulge) < 0.035) bulge = 0;                  // snap back to straight
-    if (Math.abs(bulge - e.bulge) > 1e-4){ e.bulge = bulge; scheduleRecompile('curve'); }
+    if (Math.abs(bulge - e.bulge) > 1e-4){ e.bulge = bulge; ED.dragCurve.moved = true; scheduleRecompile('curve'); }
     return true;
   }
   return false;
@@ -7340,7 +7355,7 @@ function editorUp(w, ev){
   if (ED.dragNode){
     const dn = ED.dragNode;
     ED.dragNode = null;
-    if (!dn.moved){ HIST.past.pop(); paintHistoryButtons(); return true; }
+    if (!dn.moved){ gestureEnd(dn, false); return true; }
     let joined = false;
     if (dn.merge && PLAN.nodes.has(dn.merge.id)){
       joined = planMergeNodes(dn.id, dn.merge.id);
@@ -7356,7 +7371,9 @@ function editorUp(w, ev){
     return true;
   }
   if (ED.dragCurve){
+    const dc = ED.dragCurve;
     ED.dragCurve = null;
+    if (!dc.moved){ gestureEnd(dc, false); return true; }
     const split = resolveCrossings(24);
     recompile('curve');
     if (split) toast(`${split} junction${split > 1 ? 's' : ''} created`);
@@ -7436,6 +7453,16 @@ function planMergeNodes(fromId, intoId){
 function editorCancel(){
   if (ED.draw){ ED.draw = null; return true; }
   return false;
+}
+
+/* Abandon whatever edit is under way: a draft is dropped, and a node
+   or curve drag puts the plan back as it was when the drag began.
+   True when there was something to abandon. */
+function editorAbort(){
+  const g = ED.dragNode || ED.dragCurve;
+  ED.dragNode = null; ED.dragCurve = null;
+  if (g){ ED.draw = null; gestureEnd(g, g.moved); return true; }
+  return editorCancel();
 }
 
 /* ------------------------------------------------------------
@@ -7674,7 +7701,7 @@ function setTool(t){
     close: 'Click a lane to close or reopen that direction',
     emergency: 'Click anywhere to dispatch an emergency vehicle',
   };
-  ED.draw = null; ED.dragNode = null; ED.dragCurve = null;
+  editorAbort();
   document.body.classList.toggle('editing', isEditTool(t));
   if (t !== 'select') toast(hints[t]);
 }
@@ -7813,7 +7840,11 @@ function setupPointer(){
     if (sel && sel.rangeCount) sel.removeAllRanges();
     const s = localXY(e);
     PTRS.set(e.pointerId, s);
-    if (PTRS.size === 2){ startPinch(); return; }
+    if (PTRS.size === 2){
+      /* a second finger means zoom and turn, not edit */
+      if (drag && drag.mode === 'edit') editorAbort();
+      startPinch(); return;
+    }
     if (PTRS.size > 2) return;
     applyCam();
     const w = screenToWorld(s.x, s.y);
@@ -7898,6 +7929,9 @@ function setupPointer(){
   cv.addEventListener('pointercancel', e => {
     PTRS.delete(e.pointerId);
     if (PTRS.size < 2) pinch = null;
+    /* the browser took the gesture over: abandon any edit under way,
+       or a moved junction would go on following the pointer */
+    if (drag && drag.mode === 'edit') editorAbort();
     drag = null;
     cv.classList.remove('dragging');
   });
@@ -7946,7 +7980,7 @@ function setupPointer(){
       e.preventDefault(); KEYS.add(k);
     }
     else if (k === 'escape'){
-      if (!editorCancel()){ SIM.selected = null; SIM.follow = false; CAM.chase = false; renderInspector(); }
+      if (!editorAbort()){ SIM.selected = null; SIM.follow = false; CAM.chase = false; renderInspector(); }
       $('help').classList.remove('show');
     }
     else if (k === '?' || (k === '/' && e.shiftKey)) $('help').classList.toggle('show');
@@ -7971,8 +8005,9 @@ function keyPan(dt){
   SIM.follow = false; CAM.chase = false;
 }
 
-function doUndo(){ ED.draw = null; if (!undo()) toast('Nothing to undo'); }
-function doRedo(){ ED.draw = null; if (!redo()) toast('Nothing to redo'); }
+/* mid-drag, undo means "put it back as it was" */
+function doUndo(){ if ((ED.dragNode || ED.dragCurve) && editorAbort()) return; ED.draw = null; if (!undo()) toast('Nothing to undo'); }
+function doRedo(){ editorAbort(); ED.draw = null; if (!redo()) toast('Nothing to redo'); }
 
 function hoverTip(px, py){
   const tip = $('tooltip');
