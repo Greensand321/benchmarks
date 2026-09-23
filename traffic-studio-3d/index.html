@@ -1450,22 +1450,46 @@ function planToJSON(){
 const r2 = v => Math.round(v * 100) / 100;
 const r3 = v => Math.round(v * 1000) / 1000;
 
+/* Why a parsed file cannot be loaded as a network, or null.  Checked
+   before the plan is touched, so a bad file leaves the current
+   network exactly as it was. */
+function planFileProblem(j){
+  if (!j || typeof j !== 'object' || !Array.isArray(j.nodes) || !Array.isArray(j.edges))
+    return 'That file is not a saved network';
+  for (const a of j.nodes){
+    if (!Array.isArray(a) || !Number.isInteger(a[0]) || !Number.isFinite(a[1]) || !Number.isFinite(a[2]))
+      return 'A junction in that file has no valid position';
+    if (Math.abs(a[1]) > 50000 || Math.abs(a[2]) > 50000) return 'A junction in that file lies too far out';
+  }
+  for (const a of j.edges)
+    if (!Array.isArray(a) || !Number.isInteger(a[0]) || !Number.isInteger(a[1]) || !Number.isInteger(a[2]))
+      return 'A road in that file is malformed';
+  return null;
+}
+
+const num = (v, lo, hi, dflt) => Number.isFinite(v) ? clamp(v, lo, hi) : dflt;
+
+/* Load a plan, keeping every value inside the ranges the editor can
+   produce.  Returns how many roads had to be left out. */
 function planFromJSON(j){
   PLAN.nodes.clear(); PLAN.edges.clear();
-  let mn = 1, me = 1;
+  let mn = 1, me = 1, skipped = 0;
   for (const a of j.nodes || []){
-    PLAN.nodes.set(a[0], { id: a[0], x: a[1], y: a[2], control: a[3] || 'auto',
-                           portal: a[4] || 'both', weight: a[5] ?? 1, name: a[6] || '' });
+    PLAN.nodes.set(a[0], { id: a[0], x: a[1], y: a[2],
+                           control: CONTROLS.includes(a[3]) ? a[3] : 'auto',
+                           portal: PORTALS.includes(a[4]) ? a[4] : 'both',
+                           weight: num(a[5], 0, 3, 1), name: String(a[6] || '') });
     mn = Math.max(mn, a[0] + 1);
   }
   for (const a of j.edges || []){
-    if (!PLAN.nodes.has(a[1]) || !PLAN.nodes.has(a[2])) continue;
-    PLAN.edges.set(a[0], { id: a[0], a: a[1], b: a[2], bulge: a[3] || 0,
-                           lanesF: a[4] ?? 2, lanesB: a[5] ?? 2,
-                           speed: a[6] ?? CFG.speedLimit, name: a[7] || '' });
+    const lanesF = Math.round(num(a[4], 0, 4, 2)), lanesB = Math.round(num(a[5], 0, 4, 2));
+    if (!PLAN.nodes.has(a[1]) || !PLAN.nodes.has(a[2]) || a[1] === a[2] || lanesF + lanesB === 0){ skipped++; continue; }
+    PLAN.edges.set(a[0], { id: a[0], a: a[1], b: a[2], bulge: num(a[3], -1.35, 1.35, 0),
+                           lanesF, lanesB, speed: num(a[6], 20, 110, CFG.speedLimit), name: String(a[7] || '') });
     me = Math.max(me, a[0] + 1);
   }
   PLAN.nextNode = mn; PLAN.nextEdge = me;
+  return skipped;
 }
 
 const HIST = { past: [], future: [], limit: 60 };
@@ -8393,16 +8417,18 @@ function exportPlan(){
 function importPlan(file){
   const fr = new FileReader();
   fr.onload = () => {
-    try {
-      snapshot();
-      planFromJSON(JSON.parse(fr.result));
-      invalidateCompileCache();
-      for (const v of SIM.vehicles.slice()) despawn(v, false);
-      SIM.vehicles.length = 0;
-      recompile('import');
-      freeRun(); fitView();
-      toast('Network imported');
-    } catch (err){ toast('That file could not be read'); }
+    let j;
+    try { j = JSON.parse(fr.result); } catch (err){ toast('That file could not be read'); return; }
+    const problem = planFileProblem(j);
+    if (problem){ toast(problem); return; }
+    snapshot();
+    const skipped = planFromJSON(j);
+    invalidateCompileCache();
+    for (const v of SIM.vehicles.slice()) despawn(v, false);
+    SIM.vehicles.length = 0;
+    recompile('import');
+    freeRun(); fitView();
+    toast(skipped ? `Network imported — ${skipped} broken road${skipped > 1 ? 's' : ''} left out` : 'Network imported');
   };
   fr.readAsText(file);
 }
