@@ -7762,6 +7762,34 @@ function setupControls(){
   document.addEventListener('scroll', e => { if (e.target === document || e.target.id === 'app' || e.target.id === 'main') pin(); }, { capture: true, passive: true });
   document.addEventListener('focusin', () => requestAnimationFrame(pin));
 
+  /* A button clicked with the mouse lets go of the keyboard, so Enter
+     or Space later cannot press it again by surprise.  (Tabbing to a
+     button and pressing Enter still works: that click has no detail.) */
+  document.addEventListener('click', e => {
+    const b = e.target.closest && e.target.closest('button');
+    if (b && e.detail > 0) b.blur();
+  });
+
+  /* A file dropped on the page is opened by the browser, navigating
+     away and losing the network.  Take it instead: a saved network
+     loads (and can be undone), anything else is turned away. */
+  const carriesFile = e => e.dataTransfer && [...e.dataTransfer.types].some(t => t === 'Files' || t === 'text/uri-list');
+  window.addEventListener('dragover', e => { if (carriesFile(e)){ e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; } });
+  window.addEventListener('drop', e => {
+    if (!carriesFile(e)) return;
+    e.preventDefault();
+    const f = e.dataTransfer.files && e.dataTransfer.files[0];
+    if (f && (/\.json$/i.test(f.name) || f.type === 'application/json')) importPlan(f);
+    else toast('Drop a saved network (.json) here to load it');
+  });
+
+  /* closing or reloading throws away edits that were never exported */
+  window.addEventListener('beforeunload', e => {
+    if (!planDirty()) return;
+    e.preventDefault();
+    e.returnValue = '';
+  });
+
   bindRange('sInflow', v => CFG.inflow = v, v => `${v} veh/h`);
   bindRange('sTruck',  v => CFG.truckPct = v, v => `${v}%`);
   bindRange('sBias',   v => CFG.bias = v, v =>
@@ -7826,7 +7854,7 @@ function setupControls(){
   $('btnReset').addEventListener('click', () => { resetTraffic(); toast('Simulation restarted'); });
   $('btnClear').addEventListener('click', () => {
     for (const v of SIM.vehicles.slice()) despawn(v, false);
-    toast('Network cleared');
+    toast('Traffic cleared');
   });
   $('btnFit').addEventListener('click', () => fitView());
   $('compass').addEventListener('click', () => { CAM.chase = false; CAM.tyaw = CAM.yaw + angDiff(CAM.yaw, 0); });
@@ -8035,6 +8063,12 @@ function setupPointer(){
   cv.addEventListener('pointerdown', e => {
     if (cv.setPointerCapture) try { cv.setPointerCapture(e.pointerId); } catch (err) {}
     if (e.pointerType === 'mouse') e.preventDefault();
+    /* Cancelling the press also cancels the focus change a click on
+       the page would make, so the last panel button stayed focused:
+       Enter while drawing then pressed it again — "Empty canvas" wiped
+       the network.  Hand the keyboard back to the page. */
+    const ae = document.activeElement;
+    if (ae && ae !== document.body && ae.blur) ae.blur();
     const sel = window.getSelection && window.getSelection();
     if (sel && sel.rangeCount) sel.removeAllRanges();
     const s = localXY(e);
@@ -8058,7 +8092,21 @@ function setupPointer(){
     cv.classList.add('dragging');
   });
 
+  /* A release made outside the window, or while it was in the
+     background, never arrives here, and a drag left running had the
+     junction follow the pointer with no button held.  A mouse moving
+     with no button down finishes the gesture where it was left; losing
+     the window mid-gesture abandons it, as Escape would. */
+  const endLostDrag = commit => {
+    const d = drag;
+    drag = null; pinch = null; PTRS.clear();
+    cv.classList.remove('dragging');
+    if (d && d.mode === 'edit'){ if (commit) editorUp(d.last, null); else editorAbort(); }
+  };
+  window.addEventListener('blur', () => { if (drag || pinch) endLostDrag(false); });
+
   cv.addEventListener('pointermove', e => {
+    if (drag && e.pointerType === 'mouse' && e.buttons === 0) endLostDrag(true);
     const s = localXY(e);
     if (PTRS.has(e.pointerId)) PTRS.set(e.pointerId, s);
     if (pinch){ if (PTRS.size >= 2) movePinch(); return; }
@@ -8633,9 +8681,16 @@ function buildLayoutList(){
   });
 }
 
+/* the network as last loaded or exported, to tell whether edits
+   would be lost by leaving the page or loading over them */
+let cleanPlan = '';
+function markPlanClean(){ cleanPlan = JSON.stringify(planToJSON()); }
+function planDirty(){ return !!cleanPlan && JSON.stringify(planToJSON()) !== cleanPlan; }
+
 function applyLayout(id){
   const L = LAYOUTS.find(l => l.id === id);
   if (!L) return;
+  const edited = planDirty();
   snapshot();
   for (const v of SIM.vehicles.slice()) despawn(v, false);
   SIM.vehicles.length = 0; SIM.peds.length = 0;
@@ -8645,7 +8700,8 @@ function applyLayout(id){
   recompile('layout');
   freeRun();
   fitView();
-  toast(`${L.name} loaded`);
+  markPlanClean();
+  toast(edited ? `${L.name} loaded — Ctrl+Z brings back your network` : `${L.name} loaded`);
 }
 
 function paintHistoryButtons(){
@@ -8675,6 +8731,7 @@ function exportPlan(){
   a.href = URL.createObjectURL(blob);
   a.download = 'network.json';
   a.click();
+  markPlanClean();
   setTimeout(() => URL.revokeObjectURL(a.href), 2000);
   toast('Network exported');
 }
@@ -8693,6 +8750,7 @@ function importPlan(file){
     SIM.vehicles.length = 0;
     recompile('import');
     freeRun(); fitView();
+    markPlanClean();
     toast(skipped ? `Network imported — ${skipped} broken road${skipped > 1 ? 's' : ''} left out` : 'Network imported');
   };
   fr.readAsText(file);
@@ -8855,6 +8913,7 @@ function boot(){
   applyCam();
 
   applyScenario('am');
+  markPlanClean();
 
   /* pre-load the network so the opening frame is not empty */
   for (let i = 0; i < 1400; i++) stepSim(0.05);
