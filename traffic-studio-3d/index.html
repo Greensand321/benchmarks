@@ -416,6 +416,13 @@ body.editing #view{cursor:crosshair}
   #help .grid{grid-template-columns:1fr}
 }
 
+@media (max-width:600px){
+  #vmsWrap{display:none}
+  .brand{flex:1}
+  .transport{padding:0 10px;gap:5px}
+  .transport .seg{width:112px !important}
+}
+
 @media (prefers-reduced-motion:reduce){
   *{transition-duration:.01ms !important;animation-duration:.01ms !important}
 }
@@ -616,6 +623,7 @@ body.editing #view{cursor:crosshair}
           <label class="tog"><span class="lb">Vehicle trails</span><input type="checkbox" id="tTrails"><span class="sw"></span></label>
           <label class="tog"><span class="lb">Shadows</span><input type="checkbox" id="tShadows" checked><span class="sw"></span></label>
           <label class="tog"><span class="lb">Trees &amp; parks</span><input type="checkbox" id="tTrees" checked><span class="sw"></span></label>
+          <label class="tog"><span class="lb">See-through buildings</span><input type="checkbox" id="tXray" checked><span class="sw"></span></label>
           <div class="hint">Right-drag orbits the camera, <kbd>Q</kbd>/<kbd>E</kbd> rotate, <kbd>T</kbd> switches to the flat plan view.</div>
         </div>
       </div>
@@ -969,6 +977,7 @@ const CFG = {
   trails: false,
   shadows: true,
   trees: true,
+  xray: true,
 };
 
 const SIM = {
@@ -2801,8 +2810,12 @@ function updateSignals(dt){
     /* --- emergency pre-emption --- */
     if (CFG.preempt && c.preemptUntil > SIM.t && c.preemptGroup != null){
       const cur = P[c.phase];
-      if (cur.g === c.preemptGroup && cur.greens){ c.tin = 0; continue; }
-      if (cur.greens && cur.g !== c.preemptGroup && c.tin > 1.0){ advance(c, P); continue; }
+      /* Hold the movement the emergency vehicle needs.  Matching only
+         its approach group held a protected-left arrow just as well,
+         leaving a straight-through ambulance at a red. */
+      const serves = cur.greens && (c.preemptMove ? cur.greens.includes(c.preemptMove) : cur.g === c.preemptGroup);
+      if (serves){ c.tin = 0; continue; }
+      if (cur.greens && c.tin > 1.0){ advance(c, P); continue; }
       if (c.tin >= cur.dur) advance(c, P);
       continue;
     }
@@ -3346,7 +3359,7 @@ function mayEnter(v, c, dist){
 
   if (v.emerg && CFG.preempt){
     const ctl = node.ctl;
-    if (ctl){ ctl.preemptGroup = c.inLink.groupIdx; ctl.preemptUntil = SIM.t + 5; }
+    if (ctl){ ctl.preemptGroup = c.inLink.groupIdx; ctl.preemptMove = c.group; ctl.preemptUntil = SIM.t + 5; }
   }
 
   const impatient = v.yieldTime > 9;
@@ -4312,6 +4325,43 @@ const MAT = {
 TEX_GROUND.repeat.set(1, 1);
 
 /* ------------------------------------------------------------
+   See-through buildings
+
+   Close in and low down, the towers between the camera and what it
+   is looking at hide the street.  Facades and roofs inside a
+   cylinder around the line of sight are cut away, with an ordered
+   dither at the rim so the edge reads as a fade rather than a
+   slice.  Shadows still come from the whole building.
+   ------------------------------------------------------------ */
+const XRAY = {
+  uCamPos: { value: new THREE.Vector3() }, uTarget: { value: new THREE.Vector3() }, uXray: { value: 0 },
+};
+function xrayMaterial(mat){
+  mat.onBeforeCompile = sh => {
+    Object.assign(sh.uniforms, XRAY);
+    sh.vertexShader = 'varying vec3 vXw;\n' + sh.vertexShader.replace('#include <begin_vertex>',
+      '#include <begin_vertex>\n  vXw = (modelMatrix * vec4(transformed, 1.0)).xyz;');
+    sh.fragmentShader = `uniform vec3 uCamPos; uniform vec3 uTarget; uniform float uXray;
+varying vec3 vXw;
+float xb2(vec2 q){ return mod(2.0 * q.x + 3.0 * q.y, 4.0); }
+float xbayer(vec2 p){ p = floor(p); return (4.0 * xb2(mod(p, 2.0)) + xb2(mod(floor(p * 0.5), 2.0)) + 0.5) / 16.0; }
+` + sh.fragmentShader.replace('void main() {', `void main() {
+  if (uXray > 0.0){
+    vec3 ab = uTarget - uCamPos;
+    float t = dot(vXw - uCamPos, ab) / dot(ab, ab);
+    if (t > 0.0 && t < 0.97){
+      float d = length(vXw - (uCamPos + ab * t));
+      float k = 1.0 - smoothstep(uXray * 0.5, uXray, d);
+      if (k > xbayer(gl_FragCoord.xy)) discard;
+    }
+  }`);
+  };
+  mat.customProgramCacheKey = () => 'xray';
+}
+xrayMaterial(MAT.facade);
+xrayMaterial(MAT.roof);
+
+/* ------------------------------------------------------------
    Geometry assembly
 
    Everything static is merged into a handful of big buffers so a
@@ -5259,37 +5309,49 @@ function buildStopBarTints(){
   for (const link of NET.links){
     if (link.to.kind !== 'signal' || !link.lanes.length) continue;
     const p = posOnSpine(link.spine, link.len - 0.5);
-    const w = link.lanes.length * LANE_W;
-    const b0 = bar.n;
-    bandQuad(bar, p.x + p.nx * 0.12, p.y + p.ny * 0.12, p.x + p.nx * (w - 0.08), p.y + p.ny * (w - 0.08), 0.28, MARK_Y + 0.004, SIG_COL.red);
-    /* halo: bright along the bar, black (= nothing, additively) at its rim */
-    const g0 = glow.n;
-    const tx = p.tx, ty = p.ty, L = Math.hypot(tx, ty) || 1, dx = tx / L, dy = ty / L;
-    const ax = p.x + p.nx * 0.1, ay = p.y + p.ny * 0.1, bx = p.x + p.nx * w, by = p.y + p.ny * w;
-    const H = 1.1, gy = MARK_Y + 0.006;
-    const pts = [
-      [ax - dx * H, ay - dy * H, black], [bx - dx * H, by - dy * H, black],
-      [ax, ay, SIG_COL.red],             [bx, by, SIG_COL.red],
-      [ax + dx * H, ay + dy * H, black], [bx + dx * H, by + dy * H, black],
-    ];
-    const idx = pts.map(q => glow.v(q[0], gy, q[1], 0, 1, 0, 0, 0, q[2]));
-    const quad = (a, b, c, d) => {
-      if (cross2({ x: pts[a][0], y: pts[a][1] }, { x: pts[b][0], y: pts[b][1] }, { x: pts[c][0], y: pts[c][1] }) < 0){
-        glow.t(idx[a], idx[b], idx[c]); glow.t(idx[a], idx[c], idx[d]);
-      } else { glow.t(idx[a], idx[c], idx[b]); glow.t(idx[a], idx[d], idx[c]); }
-    };
-    quad(0, 1, 3, 2); quad(2, 3, 5, 4);
-    TINT.list.push({ link, b0, b1: bar.n, g0, st: '' });
+    const tl = Math.hypot(p.tx, p.ty) || 1, dx = p.tx / tl, dy = p.ty / tl;
+    const nl = link.lanes.length;
+    /* one bar per lane, lit by the movements that lane serves, so a
+       protected left arrow shows on the left-turn lane alone */
+    for (const lane of link.lanes){
+      const groups = [...new Set(lane.out.map(c => c.group))];
+      if (!groups.length) continue;
+      const u0 = (nl - lane.index - 1) * LANE_W, u1 = u0 + LANE_W;
+      const a0 = u0 + (lane.index === nl - 1 ? 0.12 : 0.06), a1 = u1 - (lane.index === 0 ? 0.08 : 0.06);
+      const b0 = bar.n;
+      bandQuad(bar, p.x + p.nx * a0, p.y + p.ny * a0, p.x + p.nx * a1, p.y + p.ny * a1, 0.28, MARK_Y + 0.004, SIG_COL.red);
+      /* halo: bright along the bar, black (= nothing, additively) at its rim */
+      const g0 = glow.n;
+      const ax = p.x + p.nx * u0, ay = p.y + p.ny * u0, bx = p.x + p.nx * u1, by = p.y + p.ny * u1;
+      const H = 1.1, gy = MARK_Y + 0.006;
+      const pts = [
+        [ax - dx * H, ay - dy * H, black], [bx - dx * H, by - dy * H, black],
+        [ax, ay, SIG_COL.red],             [bx, by, SIG_COL.red],
+        [ax + dx * H, ay + dy * H, black], [bx + dx * H, by + dy * H, black],
+      ];
+      const idx = pts.map(q => glow.v(q[0], gy, q[1], 0, 1, 0, 0, 0, q[2]));
+      const quad = (a, b, c, d) => {
+        if (cross2({ x: pts[a][0], y: pts[a][1] }, { x: pts[b][0], y: pts[b][1] }, { x: pts[c][0], y: pts[c][1] }) < 0){
+          glow.t(idx[a], idx[b], idx[c]); glow.t(idx[a], idx[c], idx[d]);
+        } else { glow.t(idx[a], idx[c], idx[b]); glow.t(idx[a], idx[d], idx[c]); }
+      };
+      quad(0, 1, 3, 2); quad(2, 3, 5, 4);
+      TINT.list.push({ node: link.to, groups, b0, b1: bar.n, g0, st: '' });
+    }
   }
   TINT.mesh = addMesh(STATIC3D, bar, MAT_TINT, { order: 4 });
   TINT.glow = addMesh(STATIC3D, glow, MAT_TINT_GLOW, { order: 4 });
 }
 
-function approachState(link){
-  const n = link.to;
-  const thr = groupState(n, 'g' + link.groupIdx + 'Thru');
-  const lft = groupState(n, 'g' + link.groupIdx + 'Left');
-  return thr !== 'red' ? thr : (lft !== 'red' ? lft : 'red');
+/* the most permissive state among a set of movement groups */
+const STATE_RANK = { red: 0, yellow: 1, green: 2 };
+function bestState(node, groups){
+  let best = 'red';
+  for (const g of groups){
+    const st = groupState(node, g);
+    if ((STATE_RANK[st] || 0) > STATE_RANK[best]) best = st;
+  }
+  return best;
 }
 
 function updateStopBarTints(){
@@ -5298,7 +5360,7 @@ function updateStopBarTints(){
   const ga = TINT.glow ? TINT.glow.geometry.getAttribute('color') : null;
   let dirty = false;
   for (const t of TINT.list){
-    const st = approachState(t.link);
+    const st = bestState(t.node, t.groups);
     if (st === t.st) continue;
     t.st = st; dirty = true;
     const col = SIG_COL[st] || SIG_COL.red;
@@ -6542,6 +6604,12 @@ function updateOverlays(){
     }
   }
 
+  /* a junction being dragged onto another will join it */
+  if (ED.dragNode && ED.dragNode.merge){
+    const m = ED.dragNode.merge;
+    handles.push({ x: m.x, y: m.y, col: OC.green, size: 26, ring: true });
+  }
+
   /* curve handle */
   if (SIM.tool === 'curve'){
     const e = ED.dragCurve ? PLAN.edges.get(ED.dragCurve.id)
@@ -6701,6 +6769,9 @@ function updateEdLabel(){
            (xs ? `<span class="dim"> · ${xs} crossing${xs > 1 ? 's' : ''}</span>` : '') +
            `\n<span class="dim">${CFG.newLanesF}+${CFG.newLanesB} lanes · ${CFG.newSpeed} km/h</span>`;
     at = { x: d.tx, y: d.ty };
+  } else if (ED.dragNode && ED.dragNode.merge){
+    html = '<span class="ok">release to join</span>';
+    at = ED.dragNode.merge;
   } else if (ED.dragCurve){
     const e = PLAN.edges.get(ED.dragCurve.id);
     if (e){
@@ -6726,6 +6797,10 @@ let RENDER_LEAD = 0;          // sim seconds accumulated but not yet stepped
 function draw(dtReal){
   applyCam();
   updateEnvironment();
+  /* cut away buildings on the line of sight when close and low */
+  XRAY.uXray.value = CFG.xray && CAM.dist < 520 && CAM.pitch < 1.3 ? clamp(CAM.dist * 0.17, 9, 48) : 0;
+  XRAY.uCamPos.value.copy(camera.position);
+  XRAY.uTarget.value.set(CAM.x, 4, CAM.y);
   const dtR = dtReal * (SIM.running ? SIM.speed : 1);
 
   GLOWS.begin();
@@ -7083,9 +7158,15 @@ function draftProblem(d){
   for (let s = 8; s < L - 8; s += 4){
     const x = d.x + ux * s, y = d.y + uy * s;
     for (const rec of NET.byEdge.values()){
-      const half = Math.max(rec.edge.lanesF, rec.edge.lanesB) * LANE_W;
+      const e = rec.edge;
+      const half = Math.max(e.lanesF, e.lanesB) * LANE_W;
       const pr = projectOnSpine(rec.spine, x, y);
       if (pr.d2 > half * half) continue;
+      /* a point beyond either end projects onto that end: it is not
+         on this road, however close — that is a road continuing on */
+      if (pr.s < 0.5 || pr.s > rec.spine.len - 0.5) continue;
+      const lat = (x - pr.x) * -pr.ty + (y - pr.y) * pr.tx;
+      if (lat > e.lanesF * LANE_W + 0.5 || lat < -e.lanesB * LANE_W - 0.5) continue;
       if (Math.abs(ux * pr.tx + uy * pr.ty) > cos20) return 'runs along an existing road';
     }
   }
@@ -7185,6 +7266,14 @@ function editorMove(w, ev){
       ED.dragNode.moved = true;
       scheduleRecompile('move');
     }
+    /* dropping a junction onto another one joins them */
+    let merge = null;
+    for (const m of PLAN.nodes.values()){
+      if (m.id === n.id) continue;
+      const d = Math.hypot(m.x - n.x, m.y - n.y);
+      if (d < Math.max(4, pickTol(w, 11)) && (!merge || d < merge.d)) merge = { id: m.id, x: m.x, y: m.y, d };
+    }
+    ED.dragNode.merge = merge;
     return true;
   }
 
@@ -7207,13 +7296,31 @@ function editorMove(w, ev){
 
 function editorUp(w, ev){
   if (ED.dragNode){
-    if (!ED.dragNode.moved) HIST.past.pop();
+    const dn = ED.dragNode;
     ED.dragNode = null;
+    if (!dn.moved){ HIST.past.pop(); paintHistoryButtons(); return true; }
+    let joined = false;
+    if (dn.merge && PLAN.nodes.has(dn.merge.id)){
+      joined = planMergeNodes(dn.id, dn.merge.id);
+      if (joined) invalidateCompileCache();
+    }
+    /* like a road drawn across others, a road moved across them
+       should meet them at a junction rather than pass through */
+    const split = resolveCrossings(24);
     recompile('move');                                  // full rebuild on release
+    if (joined) toast('Junctions joined');
+    else if (split) toast(`${split} junction${split > 1 ? 's' : ''} created`);
     paintHistoryButtons();
     return true;
   }
-  if (ED.dragCurve){ ED.dragCurve = null; recompile('curve'); paintHistoryButtons(); return true; }
+  if (ED.dragCurve){
+    ED.dragCurve = null;
+    const split = resolveCrossings(24);
+    recompile('curve');
+    if (split) toast(`${split} junction${split > 1 ? 's' : ''} created`);
+    paintHistoryButtons();
+    return true;
+  }
 
   if (ED.draw){
     const d = ED.draw;
@@ -7264,6 +7371,24 @@ function editorUp(w, ev){
     return true;
   }
   return false;
+}
+
+/* move every road off one node onto another, dropping any that
+   would become a loop or duplicate a road already there */
+function planMergeNodes(fromId, intoId){
+  if (fromId === intoId || !PLAN.nodes.has(fromId) || !PLAN.nodes.has(intoId)) return false;
+  for (const e of [...PLAN.edges.values()]){
+    if (e.a !== fromId && e.b !== fromId) continue;
+    const a = e.a === fromId ? intoId : e.a, b = e.b === fromId ? intoId : e.b;
+    let drop = a === b;
+    if (!drop) for (const o of PLAN.edges.values())
+      if (o !== e && ((o.a === a && o.b === b) || (o.a === b && o.b === a))){ drop = true; break; }
+    if (drop) PLAN.edges.delete(e.id);
+    else { e.a = a; e.b = b; }
+  }
+  PLAN.nodes.delete(fromId);
+  for (const n of [...PLAN.nodes.values()]) if (planDegree(n.id) === 0) PLAN.nodes.delete(n.id);
+  return true;
 }
 
 function editorCancel(){
@@ -7412,6 +7537,7 @@ function setupControls(){
   bindTog('tDetect', v => CFG.detectors = v);
   bindTog('tBuild', v => { CFG.buildings = v; buildCity(); cityDirty = false; });
   bindTog('tShadows', v => { CFG.shadows = v; });
+  bindTog('tXray', v => { CFG.xray = v; });
   bindTog('tTrees', v => { CFG.trees = v; buildCity(); cityDirty = false; });
   bindTog('tLights', v => CFG.headlights = v);
   bindTog('tTrails', v => { CFG.trails = v; if (!v) for (const x of SIM.vehicles) x.trail.length = 0; });
@@ -7478,7 +7604,7 @@ function syncControls(){
     tAdaptive: CFG.adaptive, tProtLeft: CFG.protLeft, tPreempt: CFG.preempt,
     tClock: CFG.advanceClock, tPeds: CFG.peds, tHeat: CFG.heat, tDetect: CFG.detectors,
     tBuild: CFG.buildings, tLights: CFG.headlights, tTrails: CFG.trails,
-    tShadows: CFG.shadows, tTrees: CFG.trees,
+    tShadows: CFG.shadows, tTrees: CFG.trees, tXray: CFG.xray,
   };
   for (const k in togs){ const el = $(k); if (el) el.checked = togs[k]; }
 }
@@ -8017,6 +8143,12 @@ function paintCharts(){
 
     const cv2 = $('ivCurve');
     cv2.addEventListener('pointerdown', () => snapshot());
+    cv2.addEventListener('change', () => {
+      /* once the slider settles, a bend swung across another road
+         becomes a junction there */
+      const split = resolveCrossings(24);
+      if (split){ recompile('curve'); toast(`${split} junction${split > 1 ? 's' : ''} created`); }
+    });
     cv2.addEventListener('input', () => {
       const pe = PLAN.edges.get(e.id);
       if (!pe) return;
@@ -8103,6 +8235,7 @@ function paintCharts(){
     $('ivHold').addEventListener('click', () => {
       const p = curPhase(n);
       n.ctl.preemptGroup = p && p.g != null ? p.g : 0;
+      n.ctl.preemptMove = null;
       n.ctl.preemptUntil = SIM.t + 10;
       toast('Phase held for 10 seconds');
     });
@@ -8432,7 +8565,9 @@ function boot(){
 
   document.getElementById('boot').classList.add('gone');
   if (!ClipperLib) setTimeout(() => toast('Polygon library unavailable — roads are drawn without raised kerbs'), 1200);
-  setTimeout(() => toast('Draw roads with the road tool — right-drag to orbit, ? for all controls'), 3000);
+  const touch = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
+  setTimeout(() => toast(touch ? 'Draw roads with the road tool — two fingers to zoom and rotate'
+                               : 'Draw roads with the road tool — right-drag to orbit, ? for all controls'), 3000);
 
   requestAnimationFrame(frame);
 }
@@ -8443,6 +8578,17 @@ window.GRID3D = {
   applyCam, screenToWorld, worldToScreen, recompile, fitView, setTool, applyLayout, applyScenario,
   stepSim, buildStatic, buildCity, togglePlanView, rotateView, zoomBy, resetTraffic, undo, redo,
   editorDown, editorMove, editorUp, editorCancel, setEdgeProp, setNodeProp,
+  perfProbe(n){
+    /* JS cost of one frame's scene update, without the GPU render */
+    const r = renderer.render; renderer.render = () => {};
+    const t0 = performance.now();
+    for (let i = 0; i < n; i++) draw(1 / 60);
+    const ms = (performance.now() - t0) / n;
+    renderer.render = r;
+    const t1 = performance.now();
+    for (let i = 0; i < 5; i++) stepSim(0.02);
+    return { frameMs: +ms.toFixed(2), stepMs: +((performance.now() - t1) / 5).toFixed(2), veh: SIM.vehicles.length };
+  },
   get lead(){ return RENDER_LEAD; },
 };
 
