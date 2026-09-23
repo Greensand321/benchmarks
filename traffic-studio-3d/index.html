@@ -4076,6 +4076,17 @@ function screenToWorld(px, py, h){
   return { x: o.x + d.x * t, y: o.z + d.z * t, hit };
 }
 
+/* The ground point to edit at.  Off the ground — in the sky, or so
+   near the horizon that a pixel spans tens of metres — the last good
+   point is held instead, so a slip of the pointer cannot fling a
+   road off toward the horizon.  Null until there has been one. */
+let lastEditPt = null;
+function editPoint(px, py){
+  const w = screenToWorld(px, py);
+  if (w.hit && Math.hypot(w.x - CAM.x, w.y - CAM.y) < CAM.dist * 4){ lastEditPt = w; return w; }
+  return lastEditPt && { x: lastEditPt.x, y: lastEditPt.y, hit: true, held: true };
+}
+
 function worldToScreen(wx, wy, h){
   _v3.set(wx, h || 0, wy).applyMatrix4(camera.matrixWorldInverse);
   const behind = _v3.z > -camera.near;
@@ -7395,8 +7406,8 @@ function editorUp(w, ev){
     if (ED.draw && ev && typeof ev.clientX === 'number'){
       /* aim the next segment at wherever the pointer already is */
       const r = cv.getBoundingClientRect();
-      const w2 = screenToWorld(ev.clientX - r.left, ev.clientY - r.top);
-      editorMove(w2, ev);
+      const w2 = editPoint(ev.clientX - r.left, ev.clientY - r.top);
+      if (w2) editorMove(w2, ev);
     }
     if (e){ SIM.selected = { kind: 'edge', ref: e }; renderInspector(); }
     return true;
@@ -7807,8 +7818,10 @@ function setupPointer(){
     applyCam();
     const w = screenToWorld(s.x, s.y);
     const orbit = e.button === 2 || (e.button === 0 && e.altKey);
-    if (!orbit && e.button === 0 && isEditTool(SIM.tool) && w.hit && editorDown(w, e)){
-      drag = { mode: 'edit', last: w };
+    lastEditPt = null;
+    const ew = editPoint(s.x, s.y);
+    if (!orbit && e.button === 0 && isEditTool(SIM.tool) && ew && !ew.held && editorDown(ew, e)){
+      drag = { mode: 'edit', last: ew };
       return;
     }
     drag = { mode: orbit ? 'orbit' : 'pan', x: s.x, y: s.y, lx: s.x, ly: s.y, moved: 0, grab: w };
@@ -7821,7 +7834,7 @@ function setupPointer(){
     if (pinch){ if (PTRS.size >= 2) movePinch(); return; }
     if (drag && drag.mode === 'edit'){
       applyCam();
-      drag.last = screenToWorld(s.x, s.y);
+      drag.last = editPoint(s.x, s.y) || drag.last;
       editorMove(drag.last, e);
       return;
     }
@@ -7848,7 +7861,8 @@ function setupPointer(){
     }
     if (isEditTool(SIM.tool)){
       applyCam();
-      editorMove(screenToWorld(s.x, s.y), e);
+      const w = editPoint(s.x, s.y);
+      if (w) editorMove(w, e);
       $('tooltip').classList.remove('show');
       return;
     }
@@ -7864,7 +7878,7 @@ function setupPointer(){
     drag = null;
     if (!d) return;
     applyCam();
-    if (d.mode === 'edit'){ editorUp(screenToWorld(s.x, s.y), e); return; }
+    if (d.mode === 'edit'){ editorUp(editPoint(s.x, s.y) || d.last, e); return; }
     if (d.moved > 4) return;
     /* a click rather than a drag */
     if (d.mode === 'orbit'){
