@@ -7935,7 +7935,7 @@ function setupPointer(){
     drag = null;
     cv.classList.remove('dragging');
   });
-  cv.addEventListener('pointerleave', () => { $('tooltip').classList.remove('show'); });
+  cv.addEventListener('pointerleave', () => { $('tooltip').classList.remove('show'); tipAt = null; });
 
   cv.addEventListener('wheel', e => {
     e.preventDefault();
@@ -8021,10 +8021,14 @@ function undoableSlider(el){
 function doUndo(){ if ((ED.dragNode || ED.dragCurve) && editorAbort()) return; ED.draw = null; if (!undo()) toast('Nothing to undo'); }
 function doRedo(){ editorAbort(); ED.draw = null; if (!redo()) toast('Nothing to redo'); }
 
+const KIND_LABEL = { signal: 'Signals', stop: 'All-way stop', yield: 'Yield', plain: 'Uncontrolled' };
+let tipAt = null;                 // where the tooltip was last asked for
+
 function hoverTip(px, py){
   const tip = $('tooltip');
   const hit = hitTest(px, py);
-  if (!hit){ tip.classList.remove('show'); return; }
+  if (!hit){ tip.classList.remove('show'); tipAt = null; return; }
+  tipAt = { x: px, y: py };
   let txt;
   if (hit.kind === 'vehicle'){
     const v = hit.ref;
@@ -8036,8 +8040,9 @@ function hoverTip(px, py){
           (isFinite(R) ? `\nradius ${R.toFixed(0)} m` : '');
   } else {
     const n = hit.ref;
-    const ph = curPhase(n);
-    txt = `${n.name || n.kind}\n${ph ? ph.nm : n.kind}   ${n.ctl ? n.ctl.tin.toFixed(1) + 's' : ''}`;
+    const ph = n.kind === 'signal' ? curPhase(n) : null;
+    const label = KIND_LABEL[n.kind] || n.kind;
+    txt = `${n.name || label}\n${ph ? ph.nm + '   ' + n.ctl.tin.toFixed(1) + 's' : label}`;
   }
   tip.textContent = txt;
   tip.style.left = Math.min(px + 14, VW - 170) + 'px';
@@ -8598,6 +8603,10 @@ function frameBody(now){
   if (statTimer <= 0){
     statTimer = 0.25;
     computeStats(); paintStats(); updateInspector();
+    /* a tooltip left standing tracks what it describes: the phase
+       clock runs on, and a junction changed in the inspector shows
+       its new control */
+    if (tipAt && !drag && $('tooltip').classList.contains('show')) hoverTip(tipAt.x, tipAt.y);
     const secs = Math.floor((CFG.timeOfDay % 1) * 60);
     $('simClock').textContent = hhmm(CFG.timeOfDay) + ':' + String(secs).padStart(2, '0');
     $('simRate').textContent = `×${SIM.speed} · ${SIM.fps.toFixed(0)} fps`;
