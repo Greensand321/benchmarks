@@ -1,0 +1,13 @@
+{
+  "name": "traffic-studio-bench",
+  "private": true,
+  "type": "module",
+  "description": "Headless scaling benchmark for the Traffic Studio simulation",
+  "scripts": {
+    "bench": "node sim-bench.mjs",
+    "bench:quick": "node sim-bench.mjs --quick"
+  },
+  "devDependencies": {
+    "playwright": "1.56.1"
+  }
+}

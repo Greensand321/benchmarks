@@ -10691,7 +10691,7 @@ function boot(){
 window.GRID3D = {
   SIM, CFG, NET, PLAN, CAM, ED, STAT, HIST, REBUILD, COMPILE, renderer, scene, camera,
   applyCam, screenToWorld, worldToScreen, recompile, fitView, setTool, applyLayout, applyScenario,
-  stepSim, buildStatic, buildCity, togglePlanView, setQuality, get Q(){ return Q; }, rotateView, zoomBy, resetTraffic, undo, redo,
+  stepSim, buildStatic, buildCity, togglePlanView, layoutGrid, LAYOUTS, findRoute, bumpRouteCache, setQuality, get Q(){ return Q; }, rotateView, zoomBy, resetTraffic, undo, redo,
   editorDown, editorMove, editorUp, editorCancel, setEdgeProp, setNodeProp,
   perfProbe(n){
     /* JS cost of one frame's scene update, without the GPU render */
@@ -10705,6 +10705,8 @@ window.GRID3D = {
     return { frameMs: +ms.toFixed(2), stepMs: +((performance.now() - t1) / 5).toFixed(2), veh: SIM.vehicles.length };
   },
   get lead(){ return RENDER_LEAD; },
+  /* restart the shared random stream, so a benchmark can replay a run */
+  reseed(seed){ RNG = mulberry32(seed); },
 };
 
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);

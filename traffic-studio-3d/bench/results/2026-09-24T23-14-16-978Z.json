@@ -1,0 +1,141 @@
+{
+  "when": "2026-09-24T23:14:16.978Z",
+  "machine": {
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "cores": 4,
+    "memGB": 16,
+    "platform": "linux 6.18.44-fc-v37",
+    "browser": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/141.0.7390.37 Safari/537.36"
+  },
+  "ladder": [
+    {
+      "grid": "4x4",
+      "junctions": 32,
+      "links": 80,
+      "inflow": 1400,
+      "compileMs": 63,
+      "vehicles": 32,
+      "vehStart": 30,
+      "peds": 13,
+      "stepMs": 0.032,
+      "usPerVeh": 1,
+      "simSpeed": 1587.3,
+      "routeUs": 10,
+      "drawJsMs": 0.76
+    },
+    {
+      "grid": "4x4",
+      "junctions": 32,
+      "links": 80,
+      "inflow": 4200,
+      "compileMs": 70,
+      "vehicles": 98,
+      "vehStart": 93,
+      "peds": 12,
+      "stepMs": 0.109,
+      "usPerVeh": 1.12,
+      "simSpeed": 456.6,
+      "routeUs": 11,
+      "drawJsMs": 0.6
+    },
+    {
+      "grid": "8x8",
+      "junctions": 96,
+      "links": 288,
+      "inflow": 6000,
+      "compileMs": 367,
+      "vehicles": 252,
+      "vehStart": 245,
+      "peds": 15,
+      "stepMs": 0.15,
+      "usPerVeh": 0.59,
+      "simSpeed": 334.4,
+      "routeUs": 27,
+      "drawJsMs": 1.07
+    },
+    {
+      "grid": "12x12",
+      "junctions": 192,
+      "links": 624,
+      "inflow": 10000,
+      "compileMs": 494,
+      "vehicles": 557,
+      "vehStart": 543,
+      "peds": 17,
+      "stepMs": 0.478,
+      "usPerVeh": 0.86,
+      "simSpeed": 104.6,
+      "routeUs": 38,
+      "drawJsMs": 2.51
+    },
+    {
+      "grid": "16x16",
+      "junctions": 320,
+      "links": 1088,
+      "inflow": 14000,
+      "compileMs": 915,
+      "vehicles": 957,
+      "vehStart": 937,
+      "peds": 12,
+      "stepMs": 1.045,
+      "usPerVeh": 1.09,
+      "simSpeed": 47.8,
+      "routeUs": 68,
+      "drawJsMs": 2.23
+    },
+    {
+      "grid": "24x24",
+      "junctions": 672,
+      "links": 2400,
+      "inflow": 20000,
+      "compileMs": 1489,
+      "vehicles": 1646,
+      "vehStart": 1618,
+      "peds": 12,
+      "stepMs": 2.547,
+      "usPerVeh": 1.55,
+      "simSpeed": 19.6,
+      "routeUs": 175,
+      "drawJsMs": 3.8
+    },
+    {
+      "grid": "32x32",
+      "junctions": 1152,
+      "links": 4224,
+      "inflow": 60000,
+      "compileMs": 3469,
+      "vehicles": 6784,
+      "vehStart": 6729,
+      "peds": 12,
+      "stepMs": 20.8,
+      "usPerVeh": 3.07,
+      "simSpeed": 2.4,
+      "routeUs": 354,
+      "drawJsMs": 16.92
+    }
+  ],
+  "determinism": {
+    "replayFromLoad": {
+      "pass": true,
+      "a": {
+        "vehicles": 136,
+        "hash": "753e96d"
+      },
+      "b": {
+        "vehicles": 136,
+        "hash": "753e96d"
+      }
+    },
+    "afterLivePlay": {
+      "pass": false,
+      "a": {
+        "vehicles": 152,
+        "hash": "6bc3c115"
+      },
+      "b": {
+        "vehicles": 149,
+        "hash": "1795c74"
+      }
+    }
+  }
+}
