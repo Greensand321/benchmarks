@@ -4932,6 +4932,7 @@ class InstPool {
     im.castShadow = !!this.opts.cast;
     im.receiveShadow = !!this.opts.receive;
     im.renderOrder = this.opts.order || 0;
+    if (this.opts.layer) im.layers.set(this.opts.layer);
     im.count = 0;
     if (old){
       im.instanceMatrix.array.set(old.instanceMatrix.array.subarray(0, Math.min(old.instanceMatrix.array.length, cap * 16)));
@@ -6125,27 +6126,13 @@ renderer.shadowMap.autoUpdate = false;
 renderer.info.autoReset = false;
 
 /* Light effects drawn as display colours — lamp pools, headlight
-   throws, signal halos, glow sprites, rain — were tuned by eye for
-   the direct path, where they are added to the screen in display
-   space and escape exposure.  Added in linear light and then exposed
-   they would come out twice as bright at their fringes, so on the
-   float path they are re-expressed to add what they always added. */
-const FXLIGHT = { uFxLinear: { value: 0 }, uFxInvExp: { value: 1 } };
-const GLSL_FXLIGHT = `
-  uniform float uFxLinear, uFxInvExp;
-  vec3 fxDisplayToLinear(vec3 c){
-    return uFxLinear > 0.5 ? sRGBTransferEOTF(vec4(c, 1.0)).rgb * uFxInvExp : c;
-  }`;
-function displayLight(mat){
-  return shaderPatch(mat, 'displayLight', sh => {
-    Object.assign(sh.uniforms, FXLIGHT);
-    sh.fragmentShader = GLSL_FXLIGHT + '\n' + sh.fragmentShader.replace('#include <opaque_fragment>', `#include <opaque_fragment>
-      if (uFxLinear > 0.5){
-        vec3 d = sRGBTransferOETF(vec4(gl_FragColor.rgb, 1.0)).rgb * gl_FragColor.a;
-        gl_FragColor = vec4(fxDisplayToLinear(d), 1.0);
-      }`);
-  });
-}
+   throws, signal halos, glow sprites, rain — were tuned by eye to be
+   added to the screen in display space, where their soft fringes
+   show.  Added in linear light those fringes all but vanish, so on
+   the float path they are drawn with the overlays, onto the finished
+   picture: exactly as the direct path draws them. */
+const LAYER_SCREENFX = 2;
+function toScreenFx(o){ o.layers.set(LAYER_SCREENFX); return o; }
 
 const FULLSCREEN_VS = `
   varying vec2 vUv;
@@ -6625,10 +6612,9 @@ function renderFrame(){
   renderer.info.reset();
   renderer.shadowMap.needsUpdate = true;
   const post = Q.post && postSupported();
-  FXLIGHT.uFxLinear.value = post ? 1 : 0;
-  FXLIGHT.uFxInvExp.value = 1 / renderer.toneMappingExposure;
   if (!post){
     camera.layers.enable(LAYER_OVERLAY);
+    camera.layers.enable(LAYER_SCREENFX);
     renderer.setRenderTarget(null);
     renderer.render(scene, camera);
     camera.layers.set(0);
@@ -6656,8 +6642,10 @@ function renderFrame(){
   renderer.setRenderTarget(null);
   renderer.render(POST.scene, POST.cam);
 
-  /* overlays, over the finished picture and against its depth */
+  /* light effects and overlays, over the finished picture and
+     against its depth */
   camera.layers.set(LAYER_OVERLAY);
+  camera.layers.enable(LAYER_SCREENFX);
   renderer.autoClear = false;
   renderer.render(scene, camera);
   renderer.autoClear = true;
@@ -6691,6 +6679,7 @@ function addMesh(group, buf, mat, opts){
   m.receiveShadow = !!(opts && opts.receive);
   m.castShadow = !!(opts && opts.cast);
   if (opts && opts.order) m.renderOrder = opts.order;
+  if (opts && opts.layer) m.layers.set(opts.layer);
   group.add(m);
   return m;
 }
@@ -6982,8 +6971,8 @@ function bendMarkings3D(n, main, fine, y){
 const TINT = { mesh: null, glow: null, list: [] };
 const MAT_TINT = atmospherePatch(new THREE.MeshBasicMaterial({ vertexColors: true, toneMapped: false, transparent: true, opacity: 0.85,
   depthWrite: false, polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -6 }), 'basic');
-const MAT_TINT_GLOW = atmospherePatch(displayLight(new THREE.MeshBasicMaterial({ vertexColors: true, toneMapped: false, transparent: true,
-  blending: THREE.AdditiveBlending, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -6 })), 'add');
+const MAT_TINT_GLOW = atmospherePatch(new THREE.MeshBasicMaterial({ vertexColors: true, toneMapped: false, transparent: true,
+  blending: THREE.AdditiveBlending, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -6 }), 'add');
 
 function buildStopBarTints(){
   TINT.list.length = 0;
@@ -7030,7 +7019,7 @@ function buildStopBarTints(){
     }
   }
   TINT.mesh = addMesh(STATIC3D, bar, MAT_TINT, { order: 4 });
-  TINT.glow = addMesh(STATIC3D, glow, MAT_TINT_GLOW, { order: 4 });
+  TINT.glow = addMesh(STATIC3D, glow, MAT_TINT_GLOW, { order: 4, layer: LAYER_SCREENFX });
 }
 
 /* the most permissive state among a set of movement groups */
@@ -7502,11 +7491,11 @@ function buildStreetLamps(){
   const poles = new InstPool(GEO_POLE, MAT.metal, kept.length, { color: false, cast: true, parent: CITY3D });
   const arms = new InstPool(GEO_BOX, MAT.metal, kept.length, { color: false, parent: CITY3D });
   const heads = new InstPool(GEO_BOX, MAT.lampHead, kept.length, { color: false, parent: CITY3D });
-  const pm = atmospherePatch(displayLight(new THREE.MeshBasicMaterial({ map: TEX_GLOW, color: C3('#ffcf94'), transparent: true, opacity: 0,
+  const pm = atmospherePatch(new THREE.MeshBasicMaterial({ map: TEX_GLOW, color: C3('#ffcf94'), transparent: true, opacity: 0,
     blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false,
-    polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -8 })), 'add');
+    polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -8 }), 'add');
   CITY3D.poolMat = pm;
-  const pools = new InstPool(GEO_FLAT, pm, kept.length, { color: false, parent: CITY3D, order: 6 });
+  const pools = new InstPool(GEO_FLAT, pm, kept.length, { color: false, parent: CITY3D, order: 6, layer: LAYER_SCREENFX });
   poles.begin(); arms.begin(); heads.begin(); pools.begin();
   for (const s of kept){
     const L = Math.hypot(s.dx, s.dy) || 1;
@@ -7529,7 +7518,7 @@ class GlowLayer {
   constructor(cap){
     this.cap = 0; this.n = 0;
     this.mat = new THREE.ShaderMaterial({
-      uniforms: { uScale: { value: 500 }, ...FXLIGHT, uFog: ATMU.uFog },
+      uniforms: { uScale: { value: 500 }, uFog: ATMU.uFog },
       vertexShader: `
         attribute float aSize; attribute vec3 aCol;
         uniform float uScale;
@@ -7542,13 +7531,12 @@ class GlowLayer {
           vCol = aCol * (1.0 - atmFogAmount((modelMatrix * vec4(position, 1.0)).xyz));
         }`,
       fragmentShader: `
-        ${GLSL_FXLIGHT}
         varying vec3 vCol;
         void main(){
           float r = length(gl_PointCoord - 0.5) * 2.0;
           if (r > 1.0) discard;
           float a = pow(1.0 - r, 1.8);
-          gl_FragColor = vec4(fxDisplayToLinear(vCol * a), 1.0);
+          gl_FragColor = vec4(vCol * a, 1.0);
         }`,
       transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, fog: false,
     });
@@ -7556,7 +7544,7 @@ class GlowLayer {
     this.pts = new THREE.Points(this.geo, this.mat);
     this.pts.frustumCulled = false;
     this.pts.renderOrder = 20;
-    scene.add(this.pts);
+    scene.add(toScreenFx(this.pts));
     this.grow(cap);
   }
   grow(cap){
@@ -7594,16 +7582,16 @@ const GLOWS = new GlowLayer(1024);
    the raw tangent would twitch), and a body pitch and roll that
    follow braking and cornering.
    ------------------------------------------------------------ */
-const MAT_BEAM = atmospherePatch(displayLight(new THREE.MeshBasicMaterial({ map: TEX_BEAM, color: C3('#ffe7c2'), transparent: true, opacity: 0,
+const MAT_BEAM = atmospherePatch(new THREE.MeshBasicMaterial({ map: TEX_BEAM, color: C3('#ffe7c2'), transparent: true, opacity: 0,
   blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false,
-  polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -8 })), 'add');
+  polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -8 }), 'add');
 const MAT_BLOB = atmospherePatch(new THREE.MeshBasicMaterial({ map: TEX_GLOW, color: 0x000000, transparent: true, opacity: 0.55,
   depthWrite: false, polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -6 }), 'basic');
 const VEH = {
   box:   new InstPool(GEO_BOX, MAT.vehicle, 2048, { cast: true, receive: true }),
   wheel: new InstPool(GEO_WHEEL, MAT.tyre, 2048, { color: false }),
   light: new InstPool(GEO_BOX, MAT.lamp, 2048, {}),
-  beam:  new InstPool(GEO_FLAT, MAT_BEAM, 256, { color: false, order: 7 }),
+  beam:  new InstPool(GEO_FLAT, MAT_BEAM, 256, { color: false, order: 7, layer: LAYER_SCREENFX }),
   blob:  new InstPool(GEO_FLAT, MAT_BLOB, 256, { color: false, order: 1 }),
 };
 const VC = {
@@ -7957,7 +7945,7 @@ const RAIN3D = (() => {
   g.setAttribute('aEnd', new THREE.BufferAttribute(end, 1));
   g.setAttribute('aIdx', new THREE.BufferAttribute(idx, 1));
   const m = new THREE.ShaderMaterial({
-    uniforms: { ...FXLIGHT, uTime: { value: 0 }, uCenter: { value: new THREE.Vector3() }, uBox: { value: 200 },
+    uniforms: { uTime: { value: 0 }, uCenter: { value: new THREE.Vector3() }, uBox: { value: 200 },
                 uCount: { value: 0 }, uLen: { value: 2 }, uAlpha: { value: 0.3 }, uCol: { value: C3('#a9c2dc') } },
     vertexShader: `
       attribute float aEnd; attribute float aIdx;
@@ -7978,12 +7966,9 @@ const RAIN3D = (() => {
         gl_Position = projectionMatrix * viewMatrix * vec4(p, 1.0);
       }`,
     fragmentShader: `
-      ${GLSL_FXLIGHT}
       uniform vec3 uCol; uniform float uAlpha; varying float vA;
       void main(){
-        float a = uAlpha * vA;
-        if (uFxLinear > 0.5) a = pow(a, 1.6);
-        gl_FragColor = vec4(fxDisplayToLinear(uCol), a);
+        gl_FragColor = vec4(uCol, uAlpha * vA);
       }`,
     transparent: true, depthWrite: false, fog: false,
   });
@@ -7991,7 +7976,7 @@ const RAIN3D = (() => {
   lines.frustumCulled = false;
   lines.renderOrder = 30;
   lines.visible = false;
-  scene.add(lines);
+  scene.add(toScreenFx(lines));
   return { lines, m };
 })();
 function updateRain(tReal){
