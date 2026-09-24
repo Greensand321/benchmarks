@@ -4983,10 +4983,10 @@ const GEO_DISC = new THREE.CylinderGeometry(0.5, 0.5, 1, 16).rotateZ(Math.PI / 2
    ------------------------------------------------------------ */
 const QUALITY_LEVELS = ['low', 'medium', 'high', 'ultra'];
 const QUALITY = {
-  low:    { name: 'Low',    dprMax: 1,   shadowSize: 1024 },
-  medium: { name: 'Medium', dprMax: 1.5, shadowSize: 2048 },
-  high:   { name: 'High',   dprMax: 2,   shadowSize: 2048 },
-  ultra:  { name: 'Ultra',  dprMax: 2,   shadowSize: 4096 },
+  low:    { name: 'Low',    dprMax: 1,   shadowSize: 1024, post: false, msaa: 0 },
+  medium: { name: 'Medium', dprMax: 1.5, shadowSize: 2048, post: true,  msaa: 2 },
+  high:   { name: 'High',   dprMax: 2,   shadowSize: 2048, post: true,  msaa: 4 },
+  ultra:  { name: 'Ultra',  dprMax: 2,   shadowSize: 4096, post: true,  msaa: 4 },
 };
 const QUALITY_HOOKS = [];
 let qualityChoice = 'auto';
@@ -5288,6 +5288,165 @@ function fitShadow(){
   }
   sun.shadow.normalBias = texel * 0.8;
   sun.target.updateMatrixWorld();
+}
+
+/* ------------------------------------------------------------
+   Post-processing
+
+   The scene is drawn into a floating-point target in linear light
+   and a last pass tone-maps it to the screen; effects slot in
+   between.  Editor and data overlays are not part of the picture —
+   their colours carry meaning — so they live on their own layer and
+   are drawn afterwards, straight to the screen, depth-tested against
+   the scene's depth, which the last pass copies across.  The Low
+   preset skips all of it and draws the scene directly, as before.
+   ------------------------------------------------------------ */
+const LAYER_OVERLAY = 1;
+function toOverlay(o){ o.layers.set(LAYER_OVERLAY); return o; }
+/* layers gate lights as well as meshes: both passes need them */
+hemi.layers.enable(LAYER_OVERLAY);
+sun.layers.enable(LAYER_OVERLAY);
+/* the shadow map is drawn once per frame, not once per pass */
+renderer.shadowMap.autoUpdate = false;
+renderer.info.autoReset = false;
+
+/* Light effects drawn as display colours — lamp pools, headlight
+   throws, signal halos, glow sprites, rain — were tuned by eye for
+   the direct path, where they are added to the screen in display
+   space and escape exposure.  Added in linear light and then exposed
+   they would come out twice as bright at their fringes, so on the
+   float path they are re-expressed to add what they always added. */
+const FXLIGHT = { uFxLinear: { value: 0 }, uFxInvExp: { value: 1 } };
+const GLSL_FXLIGHT = `
+  uniform float uFxLinear, uFxInvExp;
+  vec3 fxDisplayToLinear(vec3 c){
+    return uFxLinear > 0.5 ? sRGBTransferEOTF(vec4(c, 1.0)).rgb * uFxInvExp : c;
+  }`;
+function displayLight(mat){
+  mat.onBeforeCompile = sh => {
+    Object.assign(sh.uniforms, FXLIGHT);
+    sh.fragmentShader = GLSL_FXLIGHT + sh.fragmentShader.replace('#include <opaque_fragment>', `#include <opaque_fragment>
+      if (uFxLinear > 0.5){
+        vec3 d = sRGBTransferOETF(vec4(gl_FragColor.rgb, 1.0)).rgb * gl_FragColor.a;
+        gl_FragColor = vec4(fxDisplayToLinear(d), 1.0);
+      }`);
+  };
+  mat.customProgramCacheKey = () => 'displayLight';
+  return mat;
+}
+
+const FULLSCREEN_VS = `
+  varying vec2 vUv;
+  void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`;
+
+/* three.js's NeutralToneMapping (Khronos PBR Neutral) and sRGB
+   encoding, so the picture matches the direct path exactly */
+const GLSL_TONE = `
+  vec3 neutralTone(vec3 c){
+    const float start = 0.8 - 0.04, desat = 0.15;
+    float x = min(c.r, min(c.g, c.b));
+    float off = x < 0.08 ? x - 6.25 * x * x : 0.04;
+    c -= off;
+    float peak = max(c.r, max(c.g, c.b));
+    if (peak < start) return c;
+    float d = 1.0 - start;
+    float np = 1.0 - d * d / (peak + d - start);
+    c *= np / peak;
+    float g = 1.0 - 1.0 / (desat * (peak - np) + 1.0);
+    return mix(c, vec3(np), g);
+  }
+  vec3 toSRGB(vec3 c){
+    return mix(pow(c, vec3(0.41666)) * 1.055 - 0.055, c * 12.92, vec3(lessThanEqual(c, vec3(0.0031308))));
+  }`;
+
+const POST = {
+  rt: null, w: 0, h: 0, samples: -1, ok: null,
+  cam: new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1),
+  scene: new THREE.Scene(),
+};
+POST.composite = new THREE.ShaderMaterial({
+  uniforms: {
+    tColor: { value: null }, tDepth: { value: null }, uExposure: { value: 1 },
+  },
+  vertexShader: FULLSCREEN_VS,
+  fragmentShader: `
+    uniform sampler2D tColor, tDepth;
+    uniform float uExposure;
+    varying vec2 vUv;
+    ${GLSL_TONE}
+    void main(){
+      vec3 c = texture2D(tColor, vUv).rgb * uExposure;
+      c = neutralTone(max(c, 0.0));
+      gl_FragColor = vec4(toSRGB(clamp(c, 0.0, 1.0)), 1.0);
+      gl_FragDepth = texture2D(tDepth, vUv).r;
+    }`,
+  depthTest: true, depthWrite: true, depthFunc: THREE.AlwaysDepth,
+});
+POST.quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), POST.composite);
+POST.quad.frustumCulled = false;
+POST.scene.add(POST.quad);
+
+/* a floating-point colour buffer is needed; without one, stay direct */
+function postSupported(){
+  if (POST.ok === null){
+    const ext = renderer.extensions;
+    POST.ok = !!(renderer.capabilities.isWebGL2 && (ext.has('EXT_color_buffer_float') || ext.has('EXT_color_buffer_half_float')));
+  }
+  return POST.ok;
+}
+
+function postTarget(){
+  const w = Math.max(1, Math.round(VW * DPR)), h = Math.max(1, Math.round(VH * DPR));
+  const s = Q.msaa || 0;
+  if (POST.rt && POST.w === w && POST.h === h && POST.samples === s) return POST.rt;
+  dropPostTargets();
+  const rt = new THREE.WebGLRenderTarget(w, h, { type: THREE.HalfFloatType, samples: s, depthBuffer: true });
+  rt.texture.generateMipmaps = false;
+  rt.depthTexture = new THREE.DepthTexture(w, h);
+  rt.depthTexture.type = THREE.UnsignedIntType;       // 24-bit, like the screen's
+  POST.rt = rt; POST.w = w; POST.h = h; POST.samples = s;
+  return rt;
+}
+function dropPostTargets(){
+  if (POST.rt){ POST.rt.depthTexture.dispose(); POST.rt.dispose(); POST.rt = null; }
+  POST.w = POST.h = 0; POST.samples = -1;
+}
+QUALITY_HOOKS.push(q => { if (!q.post) dropPostTargets(); });
+toOverlay(surveyGrid);
+toOverlay(snapGrid);
+
+/* draw one frame: the scene, then (if on) the effects, then overlays */
+function renderFrame(){
+  renderer.info.reset();
+  renderer.shadowMap.needsUpdate = true;
+  const post = Q.post && postSupported();
+  FXLIGHT.uFxLinear.value = post ? 1 : 0;
+  FXLIGHT.uFxInvExp.value = 1 / renderer.toneMappingExposure;
+  if (!post){
+    camera.layers.enable(LAYER_OVERLAY);
+    renderer.setRenderTarget(null);
+    renderer.render(scene, camera);
+    camera.layers.set(0);
+    return;
+  }
+  const rt = postTarget();
+  camera.layers.set(0);
+  renderer.setRenderTarget(rt);
+  renderer.render(scene, camera);
+
+  const u = POST.composite.uniforms;
+  u.tColor.value = rt.texture;
+  u.tDepth.value = rt.depthTexture;
+  u.uExposure.value = renderer.toneMappingExposure;
+  renderer.setRenderTarget(null);
+  renderer.render(POST.scene, POST.cam);
+
+  /* overlays, over the finished picture and against its depth */
+  camera.layers.set(LAYER_OVERLAY);
+  renderer.autoClear = false;
+  renderer.render(scene, camera);
+  renderer.autoClear = true;
+  camera.layers.set(0);
 }
 
 /* ------------------------------------------------------------
@@ -5608,8 +5767,8 @@ function bendMarkings3D(n, main, fine, y){
 const TINT = { mesh: null, glow: null, list: [] };
 const MAT_TINT = new THREE.MeshBasicMaterial({ vertexColors: true, toneMapped: false, transparent: true, opacity: 0.85,
   depthWrite: false, polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -6 });
-const MAT_TINT_GLOW = new THREE.MeshBasicMaterial({ vertexColors: true, toneMapped: false, transparent: true,
-  blending: THREE.AdditiveBlending, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -6 });
+const MAT_TINT_GLOW = displayLight(new THREE.MeshBasicMaterial({ vertexColors: true, toneMapped: false, transparent: true,
+  blending: THREE.AdditiveBlending, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -6 }));
 
 function buildStopBarTints(){
   TINT.list.length = 0;
@@ -6128,9 +6287,9 @@ function buildStreetLamps(){
   const poles = new InstPool(GEO_POLE, MAT.metal, kept.length, { color: false, cast: true, parent: CITY3D });
   const arms = new InstPool(GEO_BOX, MAT.metal, kept.length, { color: false, parent: CITY3D });
   const heads = new InstPool(GEO_BOX, MAT.lampHead, kept.length, { color: false, parent: CITY3D });
-  const pm = new THREE.MeshBasicMaterial({ map: TEX_GLOW, color: C3('#ffcf94'), transparent: true, opacity: 0,
+  const pm = displayLight(new THREE.MeshBasicMaterial({ map: TEX_GLOW, color: C3('#ffcf94'), transparent: true, opacity: 0,
     blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false,
-    polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -8 });
+    polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -8 }));
   CITY3D.poolMat = pm;
   const pools = new InstPool(GEO_FLAT, pm, kept.length, { color: false, parent: CITY3D, order: 6 });
   poles.begin(); arms.begin(); heads.begin(); pools.begin();
@@ -6155,7 +6314,7 @@ class GlowLayer {
   constructor(cap){
     this.cap = 0; this.n = 0;
     this.mat = new THREE.ShaderMaterial({
-      uniforms: { uScale: { value: 500 } },
+      uniforms: { uScale: { value: 500 }, ...FXLIGHT },
       vertexShader: `
         attribute float aSize; attribute vec3 aCol;
         uniform float uScale;
@@ -6167,12 +6326,13 @@ class GlowLayer {
           vCol = aCol;
         }`,
       fragmentShader: `
+        ${GLSL_FXLIGHT}
         varying vec3 vCol;
         void main(){
           float r = length(gl_PointCoord - 0.5) * 2.0;
           if (r > 1.0) discard;
           float a = pow(1.0 - r, 1.8);
-          gl_FragColor = vec4(vCol * a, 1.0);
+          gl_FragColor = vec4(fxDisplayToLinear(vCol * a), 1.0);
         }`,
       transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, fog: false,
     });
@@ -6218,9 +6378,9 @@ const GLOWS = new GlowLayer(1024);
    the raw tangent would twitch), and a body pitch and roll that
    follow braking and cornering.
    ------------------------------------------------------------ */
-const MAT_BEAM = new THREE.MeshBasicMaterial({ map: TEX_BEAM, color: C3('#ffe7c2'), transparent: true, opacity: 0,
+const MAT_BEAM = displayLight(new THREE.MeshBasicMaterial({ map: TEX_BEAM, color: C3('#ffe7c2'), transparent: true, opacity: 0,
   blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false,
-  polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -8 });
+  polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -8 }));
 const MAT_BLOB = new THREE.MeshBasicMaterial({ map: TEX_GLOW, color: 0x000000, transparent: true, opacity: 0.55,
   depthWrite: false, polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -6 });
 const VEH = {
@@ -6499,7 +6659,7 @@ function buildHeat3D(){
   if (buf.empty) return;
   HEAT3D.mesh = new THREE.Mesh(buf.geometry(), MAT_HEAT);
   HEAT3D.mesh.renderOrder = 5;
-  scene.add(HEAT3D.mesh);
+  scene.add(toOverlay(HEAT3D.mesh));
 }
 function paintHeat3D(){
   if (!HEAT3D.mesh) return;
@@ -6534,7 +6694,7 @@ function buildDetectors3D(){
   if (buf.empty) return;
   DET3D.mesh = new THREE.Mesh(buf.geometry(), MAT_DET);
   DET3D.mesh.renderOrder = 5;
-  scene.add(DET3D.mesh);
+  scene.add(toOverlay(DET3D.mesh));
 }
 const DET_OK = C3('#5AA9D6'), DET_Q = C3('#FF5A4E');
 function paintDetectors3D(){
@@ -6581,7 +6741,7 @@ const RAIN3D = (() => {
   g.setAttribute('aEnd', new THREE.BufferAttribute(end, 1));
   g.setAttribute('aIdx', new THREE.BufferAttribute(idx, 1));
   const m = new THREE.ShaderMaterial({
-    uniforms: { uTime: { value: 0 }, uCenter: { value: new THREE.Vector3() }, uBox: { value: 200 },
+    uniforms: { ...FXLIGHT, uTime: { value: 0 }, uCenter: { value: new THREE.Vector3() }, uBox: { value: 200 },
                 uCount: { value: 0 }, uLen: { value: 2 }, uAlpha: { value: 0.3 }, uCol: { value: C3('#a9c2dc') } },
     vertexShader: `
       attribute float aEnd; attribute float aIdx;
@@ -6602,8 +6762,13 @@ const RAIN3D = (() => {
         gl_Position = projectionMatrix * viewMatrix * vec4(p, 1.0);
       }`,
     fragmentShader: `
+      ${GLSL_FXLIGHT}
       uniform vec3 uCol; uniform float uAlpha; varying float vA;
-      void main(){ gl_FragColor = vec4(uCol, uAlpha * vA); }`,
+      void main(){
+        float a = uAlpha * vA;
+        if (uFxLinear > 0.5) a = pow(a, 1.6);
+        gl_FragColor = vec4(fxDisplayToLinear(uCol), a);
+      }`,
     transparent: true, depthWrite: false, fog: false,
   });
   const lines = new THREE.LineSegments(g, m);
@@ -6683,7 +6848,7 @@ class FatLines {
     this.mesh.renderOrder = o.order || 40;
     this.mesh.visible = false;
     this.key = null;
-    scene.add(this.mesh);
+    scene.add(toOverlay(this.mesh));
   }
   set width(w){ this.mat.uniforms.uWidth.value = w; }
   dashes(on, off){ this.mat.uniforms.uDash.value = on; this.mat.uniforms.uGap.value = off; }
@@ -6761,7 +6926,7 @@ class Handles {
     this.pts.frustumCulled = false;
     this.pts.renderOrder = order || 45;
     this.pts.visible = false;
-    scene.add(this.pts);
+    scene.add(toOverlay(this.pts));
   }
   /* list: [{ x, y, h, col, a, size, ring }] */
   set(list){
@@ -6803,7 +6968,7 @@ const OVL = {
     const m = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshBasicMaterial({
       color: OC.cyan, transparent: true, opacity: 0.26, depthTest: false, depthWrite: false, side: THREE.DoubleSide, toneMapped: false }));
     m.renderOrder = 43; m.frustumCulled = false; m.visible = false;
-    scene.add(m);
+    scene.add(toOverlay(m));
     return m;
   })(),
 };
@@ -7040,7 +7205,7 @@ const TRAILS3D = (() => {
   const m = new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, depthWrite: false, toneMapped: false });
   const l = new THREE.LineSegments(g, m);
   l.frustumCulled = false; l.renderOrder = 29; l.visible = false;
-  scene.add(l);
+  scene.add(toOverlay(l));
   return { l, g, cap: 0, P: null, C: null };
 })();
 function updateTrails3D(){
@@ -7138,7 +7303,7 @@ function draw(dtReal){
   MAT.paintFine.opacity = fine;
   if (STAT.fineMesh) STAT.fineMesh.visible = fine > 0.02;
 
-  renderer.render(scene, camera);
+  renderFrame();
 
   updateEdLabel();
   drawScaleBar();
