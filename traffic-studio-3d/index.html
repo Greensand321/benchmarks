@@ -5010,10 +5010,10 @@ const GEO_DISC = new THREE.CylinderGeometry(0.5, 0.5, 1, 16).rotateZ(Math.PI / 2
    ------------------------------------------------------------ */
 const QUALITY_LEVELS = ['low', 'medium', 'high', 'ultra'];
 const QUALITY = {
-  low:    { name: 'Low',    dprMax: 1,   shadowSize: 1024, post: false, msaa: 0, cloudShadows: false, ibl: false, bloom: 0 },
-  medium: { name: 'Medium', dprMax: 1.5, shadowSize: 2048, post: true,  msaa: 2, cloudShadows: true, ibl: true, bloom: 5 },
-  high:   { name: 'High',   dprMax: 2,   shadowSize: 2048, post: true,  msaa: 4, cloudShadows: true, ibl: true, bloom: 6 },
-  ultra:  { name: 'Ultra',  dprMax: 2,   shadowSize: 4096, post: true,  msaa: 4, cloudShadows: true, ibl: true, bloom: 7 },
+  low:    { name: 'Low',    dprMax: 1,   shadowSize: 1024, post: false, msaa: 0, cloudShadows: false, ibl: false, bloom: 0, ao: 0 },
+  medium: { name: 'Medium', dprMax: 1.5, shadowSize: 2048, post: true,  msaa: 2, cloudShadows: true, ibl: true, bloom: 5, ao: 8 },
+  high:   { name: 'High',   dprMax: 2,   shadowSize: 2048, post: true,  msaa: 4, cloudShadows: true, ibl: true, bloom: 6, ao: 12 },
+  ultra:  { name: 'Ultra',  dprMax: 2,   shadowSize: 4096, post: true,  msaa: 4, cloudShadows: true, ibl: true, bloom: 7, ao: 16 },
 };
 const QUALITY_HOOKS = [];
 let qualityChoice = 'auto';
@@ -6090,15 +6090,17 @@ POST.composite = new THREE.ShaderMaterial({
   uniforms: {
     tColor: { value: null }, tDepth: { value: null }, uExposure: { value: 1 },
     tBloom: { value: null }, uBloom: { value: 0 }, uBloomNorm: { value: 1 },
+    tAO: { value: null }, uAO: { value: 0 },
   },
   vertexShader: FULLSCREEN_VS,
   fragmentShader: `
-    uniform sampler2D tColor, tDepth, tBloom;
-    uniform float uExposure, uBloom, uBloomNorm;
+    uniform sampler2D tColor, tDepth, tBloom, tAO;
+    uniform float uExposure, uBloom, uBloomNorm, uAO;
     varying vec2 vUv;
     ${GLSL_TONE}
     void main(){
       vec3 c = texture2D(tColor, vUv).rgb;
+      if (uAO > 0.0) c *= mix(1.0, texture2D(tAO, vUv).r, uAO);
       if (uBloom > 0.0) c = mix(c, texture2D(tBloom, vUv).rgb * uBloomNorm, uBloom);
       c *= uExposure;
       c = neutralTone(max(c, 0.0));
@@ -6227,6 +6229,147 @@ function renderBloom(src){
   return L[0];
 }
 
+/* ------------------------------------------------------------
+   Ambient occlusion
+
+   Corners, the feet of buildings, the road under a car: where part
+   of the open sky is hidden, less of it lights the surface.  Worked
+   out from the depth buffer at half resolution — a hemisphere of
+   samples over each point, turned per pixel so the pattern averages
+   out — then blurred without bleeding across edges and laid over
+   the picture.  The radius grows with distance, so from high up the
+   streets still settle between the towers.
+   ------------------------------------------------------------ */
+const AO = { a: null, b: null, w: 0, h: 0, scene: new THREE.Scene() };
+function aoKernel(n){
+  const R = mulberry32(91), k = [];
+  for (let i = 0; i < n; i++){
+    const u = R(), v = R(), z = 0.3 + 0.7 * R();
+    const r = Math.sqrt(1 - z * z), a = u * Math.PI * 2;
+    const s = lerp(0.12, 1, Math.pow((i + v) / n, 2));
+    k.push(new THREE.Vector3(Math.cos(a) * r * s, Math.sin(a) * r * s, z * s));
+  }
+  return k;
+}
+AO.mat = new THREE.ShaderMaterial({
+  defines: { SAMPLES: 12 },
+  uniforms: {
+    tDepth: { value: null }, uProj: { value: new THREE.Matrix4() }, uInvProj: { value: new THREE.Matrix4() },
+    uKernel: { value: aoKernel(16) }, uTexel: { value: new THREE.Vector2() },
+    uRadius: { value: new THREE.Vector3(0.02, 0.6, 30) }, uFade: { value: new THREE.Vector2(1000, 3000) },
+  },
+  vertexShader: FULLSCREEN_VS,
+  fragmentShader: `
+    uniform sampler2D tDepth;
+    uniform mat4 uProj, uInvProj;
+    uniform vec3 uKernel[16];
+    uniform vec2 uTexel, uFade;
+    uniform vec3 uRadius;          // per metre of depth, least, most
+    varying vec2 vUv;
+    vec3 viewPos(vec2 uv){
+      float d = texture2D(tDepth, uv).r;
+      vec4 v = uInvProj * vec4(uv * 2.0 - 1.0, d * 2.0 - 1.0, 1.0);
+      return v.xyz / v.w;
+    }
+    void main(){
+      float d0 = texture2D(tDepth, vUv).r;
+      /* depth goes out in sixteenths of a metre, to stay inside half-float range */
+      if (d0 >= 1.0){ gl_FragColor = vec4(1.0, -4000.0, 0.0, 1.0); return; }
+      vec3 P = viewPos(vUv);
+      /* the surface normal, from whichever neighbour lies on the same surface */
+      vec3 pr = viewPos(vUv + vec2(uTexel.x, 0.0)) - P, pl = P - viewPos(vUv - vec2(uTexel.x, 0.0));
+      vec3 pu = viewPos(vUv + vec2(0.0, uTexel.y)) - P, pd = P - viewPos(vUv - vec2(0.0, uTexel.y));
+      vec3 N = normalize(cross(abs(pr.z) < abs(pl.z) ? pr : pl, abs(pu.z) < abs(pd.z) ? pu : pd));
+      float ang = 6.2831853 * fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+      vec3 r = vec3(cos(ang), sin(ang), 0.0);
+      vec3 T = normalize(r - N * dot(r, N)), B = cross(N, T);
+      float rad = clamp(-P.z * uRadius.x, uRadius.y, uRadius.z);
+      /* start a little off the surface, so paint and depth noise do not
+         shadow the surface they lie on */
+      vec3 O = P + N * rad * 0.06;
+      float occ = 0.0;
+      for (int i = 0; i < SAMPLES; i++){
+        vec3 k = uKernel[i];
+        vec3 s = O + (T * k.x + B * k.y + N * k.z) * rad;
+        vec4 c = uProj * vec4(s, 1.0);
+        vec2 uv = c.xy / c.w * 0.5 + 0.5;
+        float sz = viewPos(uv).z;
+        float range = smoothstep(0.0, 1.0, rad / max(abs(P.z - sz), 1e-4));
+        occ += step(s.z + rad * 0.05, sz) * range;
+      }
+      float ao = 1.0 - occ / float(SAMPLES);
+      ao = mix(ao, 1.0, smoothstep(uFade.x, uFade.y, -P.z));
+      gl_FragColor = vec4(ao, P.z * 0.0625, 0.0, 1.0);
+    }`,
+  depthTest: false, depthWrite: false,
+});
+/* seven taps along one axis, weighted down across depth edges */
+AO.blur = new THREE.ShaderMaterial({
+  uniforms: { tSrc: { value: null }, uStep: { value: new THREE.Vector2() } },
+  vertexShader: FULLSCREEN_VS,
+  fragmentShader: `
+    uniform sampler2D tSrc;
+    uniform vec2 uStep;
+    varying vec2 vUv;
+    void main(){
+      vec2 c0 = texture2D(tSrc, vUv).rg;
+      float sum = c0.r * 0.2, wsum = 0.2;
+      for (int i = 1; i <= 3; i++){
+        float g = i == 1 ? 0.17 : i == 2 ? 0.12 : 0.07;
+        for (int s = -1; s <= 1; s += 2){
+          vec2 t = texture2D(tSrc, vUv + uStep * float(i * s)).rg;
+          float w = g * exp(-abs(t.g - c0.g) / max(abs(c0.g) * 0.02, 0.003));
+          sum += t.r * w; wsum += w;
+        }
+      }
+      gl_FragColor = vec4(sum / wsum, c0.g, 0.0, 1.0);
+    }`,
+  depthTest: false, depthWrite: false,
+});
+AO.quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), AO.mat);
+AO.quad.frustumCulled = false;
+AO.scene.add(AO.quad);
+
+function aoTargets(w, h){
+  if (AO.a && AO.w === w && AO.h === h) return;
+  dropAOTargets();
+  const o = { type: THREE.HalfFloatType, depthBuffer: false, generateMipmaps: false,
+              magFilter: THREE.LinearFilter, minFilter: THREE.LinearFilter };
+  AO.a = new THREE.WebGLRenderTarget(w, h, o);
+  AO.b = new THREE.WebGLRenderTarget(w, h, o);
+  AO.w = w; AO.h = h;
+}
+function dropAOTargets(){
+  if (AO.a){ AO.a.dispose(); AO.b.dispose(); }
+  AO.a = AO.b = null; AO.w = AO.h = 0;
+}
+/* occlusion at half size, blurred across and then down */
+function renderAO(rt){
+  const n = Q.ao || 0;
+  if (!n){ if (AO.a) dropAOTargets(); return null; }
+  aoTargets(Math.max(1, POST.w >> 1), Math.max(1, POST.h >> 1));
+  const m = AO.mat;
+  if (m.defines.SAMPLES !== n){ m.defines.SAMPLES = n; m.needsUpdate = true; }
+  const u = m.uniforms;
+  u.tDepth.value = rt.depthTexture;
+  u.uProj.value.copy(camera.projectionMatrix);
+  u.uInvProj.value.copy(camera.projectionMatrixInverse);
+  u.uTexel.value.set(1 / POST.w, 1 / POST.h);
+  u.uFade.value.set(camera.far * 0.25, camera.far * 0.5);
+  AO.quad.material = m;
+  renderer.setRenderTarget(AO.a);
+  renderer.render(AO.scene, POST.cam);
+  const b = AO.blur.uniforms;
+  AO.quad.material = AO.blur;
+  b.tSrc.value = AO.a.texture; b.uStep.value.set(1 / AO.w, 0);
+  renderer.setRenderTarget(AO.b);
+  renderer.render(AO.scene, POST.cam);
+  b.tSrc.value = AO.b.texture; b.uStep.value.set(0, 1 / AO.h);
+  renderer.setRenderTarget(AO.a);
+  renderer.render(AO.scene, POST.cam);
+  return AO.a;
+}
+
 /* a floating-point colour buffer is needed; without one, stay direct */
 function postSupported(){
   if (POST.ok === null){
@@ -6252,6 +6395,7 @@ function dropPostTargets(){
   if (POST.rt){ POST.rt.depthTexture.dispose(); POST.rt.dispose(); POST.rt = null; }
   POST.w = POST.h = 0; POST.samples = -1;
   dropBloomTargets();
+  dropAOTargets();
 }
 QUALITY_HOOKS.push(q => { if (!q.post) dropPostTargets(); });
 /* after a lost context the old targets died with it: forget them
@@ -6259,6 +6403,7 @@ QUALITY_HOOKS.push(q => { if (!q.post) dropPostTargets(); });
 cv.addEventListener('webglcontextrestored', () => {
   POST.rt = null; POST.w = POST.h = 0; POST.samples = -1;
   BLOOM.levels.length = 0; BLOOM.w = BLOOM.h = BLOOM.n = 0;
+  AO.a = AO.b = null; AO.w = AO.h = 0;
   sun.shadow.map = null;
 });
 toOverlay(surveyGrid);
@@ -6284,6 +6429,7 @@ function renderFrame(){
   renderer.render(scene, camera);
 
   const bloom = renderBloom(rt);
+  const ao = renderAO(rt);
   const u = POST.composite.uniforms;
   u.tColor.value = rt.texture;
   u.tDepth.value = rt.depthTexture;
@@ -6291,6 +6437,8 @@ function renderFrame(){
   u.tBloom.value = bloom ? bloom.texture : null;
   u.uBloom.value = bloom ? lerp(0.05, 0.14, ENVSTATE.dark) + 0.05 * ENVSTATE.rain : 0;
   u.uBloomNorm.value = bloom ? 1 / BLOOM.levels.length : 1;
+  u.tAO.value = ao ? ao.texture : null;
+  u.uAO.value = ao ? 0.85 * (1 - 0.5 * ENVSTATE.dark) : 0;
   renderer.setRenderTarget(null);
   renderer.render(POST.scene, POST.cam);
 
