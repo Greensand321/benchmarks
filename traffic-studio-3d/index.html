@@ -5108,8 +5108,9 @@ Q.level = qualityChoice === 'auto' ? qualityAuto : qualityChoice;
    The same model runs in JavaScript for the few colours the lights
    need.
 
-   Darkness still comes from nightF(), exactly as in 2D, so lamps,
-   windows and the scenarios keep their clock.
+   Darkness still comes from nightF(), as in 2D, so the scenarios
+   keep their clock, except that in the evening it keeps up with the
+   sun (see updateEnvironment).
    ------------------------------------------------------------ */
 const hemi = new THREE.HemisphereLight(0xc9d7e8, 0x4a4740, 1.1);
 scene.add(hemi);
@@ -5937,15 +5938,21 @@ cv.addEventListener('webglcontextrestored', () => { ENVCAP.out = ENVCAP.cube = E
 QUALITY_HOOKS.push(q => { if (!q.ibl) dropEnvCapture(); else ENVCAP.lutSeen = null; });
 
 function updateEnvironment(dtReal){
-  const dark = nightF() / NIGHT_MAX;              // 0 day … 1 night
   const rain = CFG.rain / 100;
-  ENVSTATE.dark = dark; ENVSTATE.rain = rain;
 
   /* the sun rises in the east (+x) at about 05:50, stands in the
      south (+z, since y points south) around 12:40, sets at 19:25 */
   const h = CFG.timeOfDay / 60;
   const k = (h - 5.83) / (19.42 - 5.83);
   const el = Math.sin(clamp(k, -0.25, 1.25) * Math.PI);
+
+  /* darkness keeps the 2D clock but never falls behind the sky: that
+     clock's dusk runs twenty minutes after this sunset, and lamps and
+     windows would come on only once the sky had already gone dark.
+     Like street lights, they are half on as the sun sets */
+  const clockDark = nightF() / NIGHT_MAX;         // 0 day … 1 night
+  const dark = Math.max(clockDark, smoothstep(0.12, -0.14, el));
+  ENVSTATE.dark = dark; ENVSTATE.rain = rain;
   const az = clamp(k, 0, 1) * Math.PI;
   const sunUp = smoothstep(-0.05, 0.1, el);
   ENVSTATE.sunUp = sunUp; ENVSTATE.sunEl = el;
@@ -5968,7 +5975,10 @@ function updateEnvironment(dtReal){
   _c1.setRGB(T[0] / tm, T[1] / tm, T[2] / tm);
   sun.color.copy(ENV.moon).lerp(_c1, sunUp);
   const sunI = ATM.SUN_I * Math.sqrt(ATM.TL / 0.82) * smoothstep(-0.01, 0.06, el);
-  sun.intensity = lerp(0.35, sunI, sunUp) * (1 - rain * 0.55);
+  /* the sun fades at the horizon before the moon takes over; the
+     key light never drops below the moon's, or sunset would be the
+     darkest moment of the day */
+  sun.intensity = Math.max(lerp(0.35, sunI, sunUp), 0.35) * (1 - rain * 0.55);
 
   /* sky light: the dome's average, a little less blue than it looks,
      with a floor so night never goes black */
@@ -5986,8 +5996,8 @@ function updateEnvironment(dtReal){
   const su = skyFxMat.uniforms;
   su.uSunDir.value.copy(ATM.sun);
   su.uSunDisc.value.setRGB(T[0], T[1], T[2]).multiplyScalar(40 * (1 - rain));
-  su.uMoonDisc.value.copy(ENV.moonDisc).multiplyScalar((0.08 + 0.9 * smoothstep(0.2, 0.8, dark)) * (1 - rain * 0.9));
-  su.uStars.value = smoothstep(0.55, 1, dark) * (1 - rain);
+  su.uMoonDisc.value.copy(ENV.moonDisc).multiplyScalar((0.08 + 0.9 * smoothstep(0.2, 0.8, clockDark)) * (1 - rain * 0.9));
+  su.uStars.value = smoothstep(0.55, 1, clockDark) * (1 - rain);
   su.uTime.value = (performance.now() / 1000) % 1000;
   const Tc = ATM.Tc, tcm = Math.max(Tc[0], Tc[1], Tc[2], 1e-6);
   const cl = 2.1 * Math.sqrt(lum3(Tc[0], Tc[1], Tc[2]) / 0.85) * (1 - rain * 0.8);
