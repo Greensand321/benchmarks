@@ -4473,6 +4473,17 @@ const TEX_FACADE = canvasTex(512, 512, (x, w, h) => {
   x.fillStyle = 'rgba(0,0,0,.07)';
   for (let j = 0; j < 8; j++) x.fillRect(0, j * ch + ch - 3, w, 3);
 });
+/* glass is glossy and the wall is not (linear data, read as roughness) */
+const TEX_FACADE_ROUGH = canvasTex(512, 512, (x, w, h) => {
+  x.fillStyle = '#e0e0e0'; x.fillRect(0, 0, w, h);
+  const R = mulberry32(77), cw = w / 8, ch = h / 8;
+  for (let j = 0; j < 8; j++) for (let i = 0; i < 8; i++){
+    const x0 = i * cw + cw * 0.2, y0 = j * ch + ch * 0.2, ww = cw * 0.6, hh = ch * 0.58;
+    const v = Math.round((0.08 + R() * 0.14) * 255);
+    x.fillStyle = `rgb(${v},${v},${v})`;
+    x.fillRect(x0, y0, ww, hh);
+  }
+}, false);
 const TEX_FACADE_LIT = canvasTex(512, 512, (x, w, h) => {
   x.fillStyle = '#000'; x.fillRect(0, 0, w, h);
   const R = mulberry32(52), cw = w / 8, ch = h / 8;
@@ -4550,7 +4561,7 @@ const MAT = {
             polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -4 }),
   paintFine: new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.62, transparent: true,
             polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -4 }),
-  facade: new THREE.MeshStandardMaterial({ vertexColors: true, map: TEX_FACADE, roughness: 0.8, metalness: 0.04,
+  facade: new THREE.MeshStandardMaterial({ vertexColors: true, map: TEX_FACADE, roughness: 1, roughnessMap: TEX_FACADE_ROUGH, metalness: 0.04,
             emissive: C3('#ffc98a'), emissiveMap: TEX_FACADE_LIT, emissiveIntensity: 0 }),
   roof:   new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.96 }),
   metal:  new THREE.MeshStandardMaterial({ color: C3('#4a5059'), roughness: 0.55, metalness: 0.5 }),
@@ -4999,10 +5010,10 @@ const GEO_DISC = new THREE.CylinderGeometry(0.5, 0.5, 1, 16).rotateZ(Math.PI / 2
    ------------------------------------------------------------ */
 const QUALITY_LEVELS = ['low', 'medium', 'high', 'ultra'];
 const QUALITY = {
-  low:    { name: 'Low',    dprMax: 1,   shadowSize: 1024, post: false, msaa: 0, cloudShadows: false },
-  medium: { name: 'Medium', dprMax: 1.5, shadowSize: 2048, post: true,  msaa: 2, cloudShadows: true },
-  high:   { name: 'High',   dprMax: 2,   shadowSize: 2048, post: true,  msaa: 4, cloudShadows: true },
-  ultra:  { name: 'Ultra',  dprMax: 2,   shadowSize: 4096, post: true,  msaa: 4, cloudShadows: true },
+  low:    { name: 'Low',    dprMax: 1,   shadowSize: 1024, post: false, msaa: 0, cloudShadows: false, ibl: false },
+  medium: { name: 'Medium', dprMax: 1.5, shadowSize: 2048, post: true,  msaa: 2, cloudShadows: true, ibl: true },
+  high:   { name: 'High',   dprMax: 2,   shadowSize: 2048, post: true,  msaa: 4, cloudShadows: true, ibl: true },
+  ultra:  { name: 'Ultra',  dprMax: 2,   shadowSize: 4096, post: true,  msaa: 4, cloudShadows: true, ibl: true },
 };
 const QUALITY_HOOKS = [];
 let qualityChoice = 'auto';
@@ -5359,6 +5370,14 @@ function atmospherePatch(mat, mode){
     if (mode === 'lit' && lb.includes(ATM_DIR_HOOK))
       fs = fs.replace('#include <lights_fragment_begin>', 'float atmCS = atmCloudShadow(vAtmW);\n'
         + lb.replace(ATM_DIR_HOOK, ATM_DIR_HOOK + '\n\t\tdirectLight.color *= atmCS;'));
+    /* the captured sky is used for reflections only, and only where the
+       surface is smooth enough to show one; diffuse sky light comes
+       from the hemisphere light, which is far cheaper */
+    if (mode === 'lit')
+      fs = fs.replace('#include <lights_fragment_maps>', THREE.ShaderChunk.lights_fragment_maps
+        .replace('iblIrradiance += getIBLIrradiance( geometryNormal );', '')
+        .replace('radiance += getIBLRadiance( geometryViewDir, geometryNormal, material.roughness );',
+                 'if ( material.roughness < 0.7 ) radiance += getIBLRadiance( geometryViewDir, geometryNormal, material.roughness );'));
     fs = fs.replace('#include <tonemapping_fragment>', (mode === 'add'
       ? 'gl_FragColor.rgb *= 1.0 - atmFogAmount(vAtmW);\n'
       : 'gl_FragColor.rgb = mix(gl_FragColor.rgb, atmFogColor(vAtmW), atmFogAmount(vAtmW));\n') + '#include <tonemapping_fragment>');
@@ -5366,6 +5385,22 @@ function atmospherePatch(mat, mode){
   });
 }
 for (const k in MAT) atmospherePatch(MAT[k], MAT[k].isMeshStandardMaterial ? 'lit' : 'basic');
+
+/* Rain leaves a film on the asphalt and pools in its hollows: the
+   film darkens it and takes the edge off its roughness, the pools
+   are near mirrors.  Where they lie comes from the cloud noise, laid
+   out in world space. */
+const WET = { uWet: { value: 0 } };
+shaderPatch(MAT.road, 'wet', sh => {
+  Object.assign(sh.uniforms, WET);
+  sh.fragmentShader = 'uniform float uWet;\n' + sh.fragmentShader.replace('#include <roughnessmap_fragment>', `#include <roughnessmap_fragment>
+  if (uWet > 0.0){
+    float pool = smoothstep(0.84, 0.92, texture2D(tCloud, vAtmW.xz * 0.045).g + 0.06 * uWet)
+               * smoothstep(0.35, 0.6, texture2D(tCloud, vAtmW.xz * 0.011 + 0.5).r);
+    roughnessFactor = mix(roughnessFactor, mix(0.62, 0.04, pool), uWet);
+    diffuseColor.rgb *= mix(1.0, mix(0.82, 0.5, pool), uWet);
+  }`);
+});
 
 /* ---- the sky panorama: azimuth across, elevation up (squared, so
    the horizon, where colour changes fastest, gets most rows) ---- */
@@ -5751,6 +5786,97 @@ snapGrid.userData.sharedGeo = true;
 snapGrid.visible = false;
 scene.add(snapGrid);
 
+/* ------------------------------------------------------------
+   Sky reflections
+
+   From Medium up, glossy surfaces — glass, car bodies, wet asphalt,
+   metal — mirror the sky.  A small cube map of the dome, its clouds
+   and a stand-in for the ground is captured around the view and
+   prefiltered by roughness, and recaptured only when the sky has
+   changed.  Diffuse sky light still comes from the hemisphere
+   light, which costs far less than a lookup on every surface.
+   ------------------------------------------------------------ */
+const ENVCAP = {
+  SIZE: 64, MIN_GAP: 0.35,
+  scene: new THREE.Scene(), cube: null, cam: null, pmrem: null, out: null,
+  lutSeen: null, cloud: new THREE.Vector3(), at: new THREE.Vector2(1e9, 1e9), glow: -1, last: -1e9, n: 0,
+  groundAlbedo: C3('#262a22'),
+};
+{
+  const dome = new THREE.Mesh(new THREE.SphereGeometry(1, 32, 16), skyMat);
+  const fx = new THREE.Mesh(new THREE.SphereGeometry(1, 32, 8, 0, Math.PI * 2, 0, Math.PI / 2), skyFxMat);
+  const ground = new THREE.Mesh(new THREE.CircleGeometry(1, 48),
+    atmospherePatch(new THREE.MeshBasicMaterial({ color: 0x000000, toneMapped: false }), 'basic'));
+  ground.rotation.x = -Math.PI / 2;
+  ground.scale.setScalar(60000);
+  dome.scale.setScalar(70000); fx.scale.setScalar(70000);
+  dome.renderOrder = -1000; fx.renderOrder = -900;
+  for (const m of [dome, fx, ground]) m.frustumCulled = false;
+  ENVCAP.dome = dome; ENVCAP.fx = fx; ENVCAP.ground = ground;
+  ENVCAP.scene.add(dome, fx, ground);
+}
+
+/* only surfaces glossy enough to show a reflection look it up */
+const ENV_MATS = () => [MAT.facade, MAT.vehicle, MAT.road, MAT.metal, MAT.sign, MAT.dark, MAT.lampHead];
+function setEnvMaps(tex){
+  for (const m of ENV_MATS()) if (m.envMap !== tex){ m.envMap = tex; m.needsUpdate = true; }
+}
+function envCapture(force){
+  if (!(Q.ibl && postSupported())){
+    setEnvMaps(null);
+    return;
+  }
+  if (!ENVCAP.cube){
+    ENVCAP.cube = new THREE.WebGLCubeRenderTarget(ENVCAP.SIZE, { type: THREE.HalfFloatType, generateMipmaps: false });
+    ENVCAP.cam = new THREE.CubeCamera(1, 80000, ENVCAP.cube);
+    ENVCAP.pmrem = new THREE.PMREMGenerator(renderer);
+    force = true;
+  }
+  /* what the sky looks like now, against what was captured: a new
+     panorama, clouds drifted, the view moved on, city lights */
+  const cu = ATMU.uCloud.value;
+  const dx = (cu.x - ENVCAP.cloud.x + 1.5) % 1 - 0.5, dy = (cu.y - ENVCAP.cloud.y + 1.5) % 1 - 0.5;
+  const changed = ENVCAP.lutSeen !== ATM.key
+    || Math.hypot(dx, dy) * ATM.CLOUD_TILE > 120 || Math.abs(cu.z - ENVCAP.cloud.z) > 0.02
+    || Math.hypot(CAM.x - ENVCAP.at.x, CAM.y - ENVCAP.at.y) > 250
+    || Math.abs(ATMU.uCityGlow.value.r - ENVCAP.glow) > 0.001;
+  const now = performance.now() / 1000;
+  if (ENVCAP.out && MAT.facade.envMap !== ENVCAP.out.texture) force = true;
+  if (!force && (!changed || now - ENVCAP.last < ENVCAP.MIN_GAP)) return;
+  ENVCAP.last = now; ENVCAP.n++;
+  ENVCAP.lutSeen = ATM.key;
+  ENVCAP.cloud.copy(cu);
+  ENVCAP.at.set(CAM.x, CAM.y);
+  ENVCAP.glow = ATMU.uCityGlow.value.r;
+
+  /* the ground as it would look from above: lit by sun and sky */
+  const g = ENVCAP.ground.material.color;
+  g.copy(sun.color).multiplyScalar(sun.intensity * Math.max(ENVSTATE.dir.y, 0))
+   .add(_c1.copy(ATM.skyAvg).multiplyScalar(Math.PI))
+   .multiply(ENVCAP.groundAlbedo).multiplyScalar(1 / Math.PI)
+   .add(_c1.copy(ATMU.uCityGlow.value).multiplyScalar(0.6));
+
+  /* the sun is a light of its own; its disc in the map would shine twice */
+  const su = skyFxMat.uniforms;
+  const disc = _c2.copy(su.uSunDisc.value), stars = su.uStars.value;
+  su.uSunDisc.value.setRGB(0, 0, 0); su.uStars.value = 0;
+  ENVCAP.cam.position.set(CAM.x, 25, CAM.y);
+  ENVCAP.dome.position.copy(ENVCAP.cam.position); ENVCAP.fx.position.copy(ENVCAP.cam.position);
+  ENVCAP.ground.position.set(CAM.x, 0, CAM.y);
+  ENVCAP.cam.update(renderer, ENVCAP.scene);
+  su.uSunDisc.value.copy(disc); su.uStars.value = stars;
+  ENVCAP.out = ENVCAP.pmrem.fromCubemap(ENVCAP.cube.texture, ENVCAP.out);
+  setEnvMaps(ENVCAP.out.texture);
+}
+function dropEnvCapture(){
+  setEnvMaps(null);
+  if (ENVCAP.out){ ENVCAP.out.dispose(); ENVCAP.out = null; }
+  if (ENVCAP.cube){ ENVCAP.cube.dispose(); ENVCAP.cube = null; }
+  if (ENVCAP.pmrem){ ENVCAP.pmrem.dispose(); ENVCAP.pmrem = null; }
+}
+cv.addEventListener('webglcontextrestored', () => { ENVCAP.out = ENVCAP.cube = ENVCAP.pmrem = null; setEnvMaps(null); ENVCAP.lutSeen = null; });
+QUALITY_HOOKS.push(q => { if (!q.ibl) dropEnvCapture(); else ENVCAP.lutSeen = null; });
+
 function updateEnvironment(dtReal){
   const dark = nightF() / NIGHT_MAX;              // 0 day … 1 night
   const rain = CFG.rain / 100;
@@ -5790,8 +5916,8 @@ function updateEnvironment(dtReal){
   const A = ATM.skyAvg;
   _c2.setRGB(A.r, A.g, A.b).lerp(_c3.setScalar(avgL), 0.55).multiplyScalar(Math.PI * 0.8);
   _c3.copy(ENV.hemiSkyN).multiplyScalar(1.2);
-  hemi.color.setRGB(Math.max(_c2.r, _c3.r), Math.max(_c2.g, _c3.g), Math.max(_c2.b, _c3.b));
   const sunH = sun.intensity * Math.max(ATM.sun.y, 0) * sunUp;
+  hemi.color.setRGB(Math.max(_c2.r, _c3.r), Math.max(_c2.g, _c3.g), Math.max(_c2.b, _c3.b));
   hemi.groundColor.copy(ENV.groundAlbedo).multiplyScalar((sunH + _c2.g) * 0.8);
   _c3.copy(ENV.hemiGndN).multiplyScalar(0.8);
   hemi.groundColor.setRGB(Math.max(hemi.groundColor.r, _c3.r), Math.max(hemi.groundColor.g, _c3.g), Math.max(hemi.groundColor.b, _c3.b));
@@ -5822,14 +5948,14 @@ function updateEnvironment(dtReal){
   /* fog thickens in the rain; looking straight down on the plan it
      thins, since a whisper of haze over dark ground reads as a veil */
   const planView = smoothstep(1.1, 1.5, CAM.pitch);
-  ATMU.uFog.value.set(0.00012 * (1 + 3.5 * rain) * (1 - 0.65 * planView), 1 / (150 * (1 + 0.8 * rain)), camera.far * 0.97, 0.03);
+  ATMU.uFog.value.set(0.00012 * (1 + 2 * rain) * (1 - 0.65 * planView), 1 / (150 * (1 + 0.5 * rain)), camera.far * 0.97, 0.03);
   renderer.setClearColor(ATM.horizon, 1);
   scene.background = null;
   renderer.toneMappingExposure = lerp(1.05, 1.4, dark);
 
   /* wet pavement is darker and shinier */
   MAT.road.color.copy(ROAD_DRY).lerp(ROAD_WET, rain);
-  MAT.road.roughness = lerp(0.92, 0.34, rain);
+  WET.uWet.value = rain;
   MAT.walk.color.copy(WALK_DRY).lerp(WALK_WET, rain);
   MAT.walk.roughness = lerp(0.94, 0.55, rain);
 
@@ -5852,6 +5978,7 @@ function updateEnvironment(dtReal){
   TEX_GROUND.offset.set((CAM.x / 48) % 1, (-CAM.y / 48) % 1);
 
   fitShadow();
+  envCapture();
 }
 
 /* The shadow frustum follows the camera, sized to what is on
