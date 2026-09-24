@@ -5889,7 +5889,7 @@ function updateEnvironment(dtReal){
   const el = Math.sin(clamp(k, -0.25, 1.25) * Math.PI);
   const az = clamp(k, 0, 1) * Math.PI;
   const sunUp = smoothstep(-0.05, 0.1, el);
-  ENVSTATE.sunUp = sunUp;
+  ENVSTATE.sunUp = sunUp; ENVSTATE.sunEl = el;
   ATM.sun.set(Math.cos(az) * Math.cos(el), Math.sin(el), Math.sin(az) * Math.cos(el));
   /* shadows are cast from no lower than ~35°: a true dawn sun throws
      shadows across whole blocks and the map stops reading */
@@ -5964,7 +5964,8 @@ function updateEnvironment(dtReal){
   MAT.lampHead.emissiveIntensity = lit * 2.4;
   if (CITY3D.poolMat) CITY3D.poolMat.opacity = lit * 0.5;
 
-  document.getElementById('vignette').style.opacity = (dark * 0.75).toFixed(3);
+  /* the float pipeline draws its own vignette, under the overlays */
+  document.getElementById('vignette').style.opacity = Q.post && postSupported() ? '0' : (dark * 0.75).toFixed(3);
 
   /* keep the dome and the ground centred on the view */
   sky.position.copy(camera.position);
@@ -6091,20 +6092,36 @@ POST.composite = new THREE.ShaderMaterial({
     tColor: { value: null }, tDepth: { value: null }, uExposure: { value: 1 },
     tBloom: { value: null }, uBloom: { value: 0 }, uBloomNorm: { value: 1 },
     tAO: { value: null }, uAO: { value: 0 },
+    uSlope: { value: new THREE.Vector3(1, 1, 1) }, uOffset: { value: new THREE.Vector3() }, uSat: { value: 1 },
+    uContrast: { value: 1 }, uVignette: { value: 0 }, uGrain: { value: 0 }, uFrame: { value: 0 },
   },
   vertexShader: FULLSCREEN_VS,
   fragmentShader: `
     uniform sampler2D tColor, tDepth, tBloom, tAO;
     uniform float uExposure, uBloom, uBloomNorm, uAO;
+    uniform vec3 uSlope, uOffset;
+    uniform float uSat, uContrast, uVignette, uGrain, uFrame;
     varying vec2 vUv;
     ${GLSL_TONE}
+    float hash12(vec2 p){ vec3 q = fract(vec3(p.xyx) * 0.1031); q += dot(q, q.yzx + 33.33); return fract((q.x + q.y) * q.z); }
     void main(){
       vec3 c = texture2D(tColor, vUv).rgb;
       if (uAO > 0.0) c *= mix(1.0, texture2D(tAO, vUv).r, uAO);
       if (uBloom > 0.0) c = mix(c, texture2D(tBloom, vUv).rgb * uBloomNorm, uBloom);
       c *= uExposure;
-      c = neutralTone(max(c, 0.0));
-      gl_FragColor = vec4(toSRGB(clamp(c, 0.0, 1.0)), 1.0);
+      c = clamp(neutralTone(max(c, 0.0)), 0.0, 1.0);
+      /* grade: balance, then saturation, then contrast on the display curve */
+      c = max(c * uSlope + uOffset, 0.0);
+      float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
+      c = max(mix(vec3(l), c, uSat), 0.0);
+      vec3 s = toSRGB(clamp(c, 0.0, 1.0));
+      s = (s - 0.5) * uContrast + 0.5;
+      /* vignette, as the page's old one: clear to 42%, darkest at the corners */
+      vec2 d = (vUv - 0.5) * 1.4142136;
+      s *= 1.0 - uVignette * smoothstep(0.42, 1.0, length(d));
+      /* grain, strongest in the shadows; it also dithers away banding */
+      s += (hash12(gl_FragCoord.xy + uFrame * vec2(37.0, 17.0)) - 0.5) * uGrain * (1.0 - 0.6 * dot(s, vec3(0.3333)));
+      gl_FragColor = vec4(clamp(s, 0.0, 1.0), 1.0);
       gl_FragDepth = texture2D(tDepth, vUv).r;
     }`,
   depthTest: true, depthWrite: true, depthFunc: THREE.AlwaysDepth,
@@ -6409,6 +6426,41 @@ cv.addEventListener('webglcontextrestored', () => {
 toOverlay(surveyGrid);
 toOverlay(snapGrid);
 
+/* ------------------------------------------------------------
+   Colour grade
+
+   A light touch that follows the light: warm highlights and cool
+   shadows by day, richer and warmer at golden hour, bluer and
+   crisper at night, flatter and greyer in the rain.  With the
+   vignette and grain it replaces the page's CSS vignette, and it
+   sits under the editor overlays, whose colours are left alone.
+   ------------------------------------------------------------ */
+const GRADE = {
+  day:    { slope: [1.03, 1.0, 0.97], offset: [-0.004, -0.001, 0.006], sat: 1.06, contrast: 1.04 },
+  golden: { slope: [1.06, 1.0, 0.91], offset: [0.0, -0.002, 0.002],    sat: 1.12, contrast: 1.05 },
+  night:  { slope: [0.96, 1.0, 1.07], offset: [0.0, 0.002, 0.01],      sat: 0.94, contrast: 1.08 },
+  rain:   { slope: [0.98, 1.0, 1.02], offset: [0.0, 0.002, 0.004],     sat: 0.84, contrast: 0.98 },
+  cur: { slope: [1, 1, 1], offset: [0, 0, 0], sat: 1, contrast: 1 },
+};
+function gradeMix(a, b, t, out){
+  for (let i = 0; i < 3; i++){ out.slope[i] = lerp(a.slope[i], b.slope[i], t); out.offset[i] = lerp(a.offset[i], b.offset[i], t); }
+  out.sat = lerp(a.sat, b.sat, t); out.contrast = lerp(a.contrast, b.contrast, t);
+  return out;
+}
+let postFrame = 0;
+function updateGrade(u){
+  const g = GRADE.cur, E = ENVSTATE;
+  const golden = E.sunUp * (1 - smoothstep(0.08, 0.4, E.sunEl || 1));
+  gradeMix(GRADE.day, GRADE.golden, golden, g);
+  gradeMix(g, GRADE.night, E.dark, g);
+  gradeMix(g, GRADE.rain, E.rain * 0.8, g);
+  u.uSlope.value.fromArray(g.slope); u.uOffset.value.fromArray(g.offset);
+  u.uSat.value = g.sat; u.uContrast.value = g.contrast;
+  u.uVignette.value = lerp(0.12, 0.5, E.dark);
+  u.uGrain.value = lerp(1.5, 5, E.dark) / 255;
+  u.uFrame.value = postFrame = (postFrame + 1) % 64;
+}
+
 /* draw one frame: the scene, then (if on) the effects, then overlays */
 function renderFrame(){
   renderer.info.reset();
@@ -6439,6 +6491,7 @@ function renderFrame(){
   u.uBloomNorm.value = bloom ? 1 / BLOOM.levels.length : 1;
   u.tAO.value = ao ? ao.texture : null;
   u.uAO.value = ao ? 0.85 * (1 - 0.5 * ENVSTATE.dark) : 0;
+  updateGrade(u);
   renderer.setRenderTarget(null);
   renderer.render(POST.scene, POST.cam);
 
