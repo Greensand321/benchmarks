@@ -606,6 +606,11 @@ body.editing #view{cursor:crosshair}
             <div class="hint">Wet pavement cuts braking capability and desired speed.</div>
           </div>
           <label class="tog"><span class="lb">Pedestrians</span><input type="checkbox" id="tPeds" checked><span class="sw"></span></label>
+          <label class="tog"><span class="lb">Sound<kbd>M</kbd></span><input type="checkbox" id="tSound" checked><span class="sw"></span></label>
+          <div class="ctl">
+            <div class="ctl-top"><label for="sVolume">Volume</label><span class="val" id="vVolume">50%</span></div>
+            <input type="range" id="sVolume" min="0" max="100" step="1" value="50">
+          </div>
         </div>
       </div>
 
@@ -723,6 +728,7 @@ body.editing #view{cursor:crosshair}
                 <dt>WASD</dt><dd>Pan (arrow keys too)</dd>
                 <dt>C</dt><dd>Chase camera on the followed vehicle</dd>
                 <dt>H</dt><dd>Congestion heat map</dd>
+                <dt>M</dt><dd>Sound on or off</dd>
                 <dt>Esc</dt><dd>Clear selection</dd>
                 <dt>?</dt><dd>This panel</dd>
               </dl>
@@ -8675,6 +8681,264 @@ function worstApproach(){
   }
   return best;
 }
+
+/* ============================================================
+   7.2 · SOUND — the city, synthesised
+
+   Nothing is recorded: every sound is noise or an oscillator shaped
+   by filters, so the page stays a single file.  The mix follows the
+   view — tyres and engines from the traffic near its centre, panned
+   to where they are; a distant rumble that takes over as the camera
+   pulls back; wind that rises with height; rain; birds by day and
+   crickets at night; a horn when a queue has sat too long; a siren
+   when an emergency vehicle is near.  Browsers only let a page make
+   sound once it has been touched, so it starts on the first press.
+   ============================================================ */
+const AUDIO = {
+  ctx: null, on: true, vol: 0.5, n: null, next: { bird: 0, cricket: 0, horn: 0 }, lastMix: 0,
+};
+(() => {
+  try {
+    const s = JSON.parse(localStorage.getItem('gridcontrol.sound') || '{}');
+    if (typeof s.on === 'boolean') AUDIO.on = s.on;
+    if (typeof s.vol === 'number' && s.vol >= 0 && s.vol <= 1) AUDIO.vol = s.vol;
+  } catch (e) {}
+})();
+function saveSound(){
+  try { localStorage.setItem('gridcontrol.sound', JSON.stringify({ on: AUDIO.on, vol: AUDIO.vol })); } catch (e) {}
+}
+
+/* a few seconds of pink or brown noise, looped */
+function noiseBuffer(ctx, kind){
+  const len = Math.floor(ctx.sampleRate * 3), buf = ctx.createBuffer(1, len, ctx.sampleRate), d = buf.getChannelData(0);
+  let b0 = 0, b1 = 0, b2 = 0, b3 = 0, b4 = 0, b5 = 0, b6 = 0, last = 0;
+  for (let i = 0; i < len; i++){
+    const w = Math.random() * 2 - 1;
+    if (kind === 'brown'){ last = (last + 0.02 * w) / 1.02; d[i] = last * 3.5; continue; }
+    b0 = 0.99886 * b0 + w * 0.0555179; b1 = 0.99332 * b1 + w * 0.0750759; b2 = 0.969 * b2 + w * 0.153852;
+    b3 = 0.8665 * b3 + w * 0.3104856; b4 = 0.55 * b4 + w * 0.5329522; b5 = -0.7616 * b5 - w * 0.016898;
+    d[i] = (b0 + b1 + b2 + b3 + b4 + b5 + b6 + w * 0.5362) * 0.11;
+    b6 = w * 0.115926;
+  }
+  /* fade the seam so the loop does not click */
+  const f = Math.floor(ctx.sampleRate * 0.02);
+  for (let i = 0; i < f; i++){ const k = i / f; d[i] *= k; d[len - 1 - i] *= k; }
+  return buf;
+}
+
+function audioStart(){
+  if (AUDIO.ctx || !AUDIO.on) return;
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) return;
+  let ctx;
+  try { ctx = new AC(); } catch (e) { return; }
+  AUDIO.ctx = ctx;
+  const master = ctx.createGain();
+  master.gain.value = 0;
+  const comp = ctx.createDynamicsCompressor();
+  /* catches peaks only: a lower threshold brings automatic make-up
+     gain, which would lift a quiet night as loud as a busy street */
+  comp.threshold.value = -6; comp.knee.value = 6; comp.ratio.value = 3;
+  master.connect(comp);
+  comp.connect(ctx.destination);
+  const meter = ctx.createAnalyser();          // for level checks
+  meter.fftSize = 1024;
+  comp.connect(meter);
+  const pink = noiseBuffer(ctx, 'pink'), brown = noiseBuffer(ctx, 'brown');
+  /* a looping bed: noise → filter → gain (→ pan) → master */
+  const bed = (buf, type, freq, q, pan) => {
+    const src = ctx.createBufferSource();
+    src.buffer = buf; src.loop = true;
+    src.loopStart = Math.random() * 1.5;
+    const f = ctx.createBiquadFilter();
+    f.type = type; f.frequency.value = freq; f.Q.value = q;
+    const g = ctx.createGain();
+    g.gain.value = 0;
+    src.connect(f); f.connect(g);
+    let out = g;
+    if (pan && ctx.createStereoPanner){ const p = ctx.createStereoPanner(); g.connect(p); out = p; }
+    out.connect(master);
+    src.start(ctx.currentTime + Math.random() * 0.2);
+    return { f, g, p: out !== g ? out : null };
+  };
+  const n = {
+    master, meter,
+    rumble: bed(brown, 'lowpass', 160, 0.5, false),
+    tyres: bed(pink, 'bandpass', 800, 0.55, true),
+    engine: bed(brown, 'bandpass', 110, 1.1, true),
+    rain: bed(pink, 'highpass', 2200, 0.4, false),
+    wind: bed(brown, 'lowpass', 380, 0.9, false),
+  };
+  /* gusts: a slow wobble on the wind's filter */
+  const gust = ctx.createOscillator(), gustDepth = ctx.createGain();
+  gust.frequency.value = 0.07; gustDepth.gain.value = 170;
+  gust.connect(gustDepth); gustDepth.connect(n.wind.f.frequency);
+  gust.start();
+  /* the siren wails between two pitches */
+  const siren = ctx.createOscillator(), sirenLfo = ctx.createOscillator(), sirenDepth = ctx.createGain();
+  siren.type = 'triangle'; siren.frequency.value = 960;
+  sirenLfo.frequency.value = 0.55; sirenDepth.gain.value = 330;
+  sirenLfo.connect(sirenDepth); sirenDepth.connect(siren.frequency);
+  const sirenF = ctx.createBiquadFilter(); sirenF.type = 'lowpass'; sirenF.frequency.value = 2400;
+  const sirenG = ctx.createGain(); sirenG.gain.value = 0;
+  const sirenP = ctx.createStereoPanner ? ctx.createStereoPanner() : null;
+  siren.connect(sirenF); sirenF.connect(sirenG);
+  if (sirenP){ sirenG.connect(sirenP); sirenP.connect(master); } else sirenG.connect(master);
+  siren.start(); sirenLfo.start();
+  n.siren = { g: sirenG, p: sirenP };
+  AUDIO.n = n;
+  document.addEventListener('visibilitychange', () => {
+    if (!AUDIO.ctx) return;
+    if (document.hidden) AUDIO.ctx.suspend().catch(() => {});
+    else if (AUDIO.on) AUDIO.ctx.resume().catch(() => {});
+  });
+}
+
+/* the first press anywhere starts (or wakes) the sound */
+function audioWake(){
+  if (!AUDIO.on) return;
+  audioStart();
+  if (AUDIO.ctx && AUDIO.ctx.state !== 'running') AUDIO.ctx.resume().catch(() => {});
+}
+window.addEventListener('pointerdown', audioWake, true);
+window.addEventListener('keydown', audioWake, true);
+
+function setSound(on){
+  AUDIO.on = !!on;
+  saveSound();
+  if (AUDIO.on) audioWake();
+  else if (AUDIO.ctx){
+    const m = AUDIO.n.master.gain, t = AUDIO.ctx.currentTime;
+    m.cancelScheduledValues(t); m.setTargetAtTime(0, t, 0.05);
+    setTimeout(() => { if (!AUDIO.on && AUDIO.ctx) AUDIO.ctx.suspend().catch(() => {}); }, 300);
+  }
+}
+function setVolume(v){
+  AUDIO.vol = clamp(v, 0, 1);
+  saveSound();
+}
+
+/* one-shot voices ------------------------------------------- */
+function voice(type, f0, dur, level, pan, when){
+  const ctx = AUDIO.ctx, t = when || ctx.currentTime + 0.02;
+  const o = ctx.createOscillator(), g = ctx.createGain();
+  o.type = type;
+  g.gain.setValueAtTime(0, t);
+  g.gain.linearRampToValueAtTime(level, t + Math.min(0.012, dur * 0.2));
+  g.gain.setTargetAtTime(0, t + dur * 0.5, dur * 0.25);
+  o.connect(g);
+  let out = g;
+  if (ctx.createStereoPanner){ const p = ctx.createStereoPanner(); p.pan.value = clamp(pan, -1, 1); g.connect(p); out = p; }
+  out.connect(AUDIO.n.master);
+  o.frequency.setValueAtTime(f0, t);
+  o.start(t); o.stop(t + dur * 2 + 0.1);
+  return o.frequency;
+}
+function chirp(level, pan){
+  const t = AUDIO.ctx.currentTime + 0.02, base = 2600 + Math.random() * 1800, n = 1 + Math.floor(Math.random() * 4);
+  for (let i = 0; i < n; i++){
+    const d = 0.06 + Math.random() * 0.06, at = t + i * (d + 0.05 + Math.random() * 0.06);
+    const f = voice('sine', base, d, level * (0.6 + Math.random() * 0.4), pan, at);
+    f.setValueAtTime(base * (0.9 + Math.random() * 0.2), at);
+    f.exponentialRampToValueAtTime(base * (1.15 + Math.random() * 0.35), at + d * 0.6);
+    f.exponentialRampToValueAtTime(base * (0.8 + Math.random() * 0.2), at + d);
+  }
+}
+function cricket(level, pan){
+  const ctx = AUDIO.ctx, t = ctx.currentTime + 0.02, dur = 0.15 + Math.random() * 0.2;
+  const o = ctx.createOscillator(), am = ctx.createOscillator(), amG = ctx.createGain(), g = ctx.createGain();
+  o.frequency.value = 4200 + Math.random() * 600;
+  am.frequency.value = 26 + Math.random() * 8;
+  amG.gain.value = level * 0.5;
+  g.gain.setValueAtTime(0, t);
+  g.gain.linearRampToValueAtTime(level * 0.5, t + 0.02);
+  g.gain.setTargetAtTime(0, t + dur, 0.03);
+  am.connect(amG); amG.connect(g.gain);
+  o.connect(g);
+  let out = g;
+  if (ctx.createStereoPanner){ const p = ctx.createStereoPanner(); p.pan.value = clamp(pan, -1, 1); g.connect(p); out = p; }
+  out.connect(AUDIO.n.master);
+  o.start(t); am.start(t); o.stop(t + dur + 0.12); am.stop(t + dur + 0.12);
+}
+function horn(level, pan){
+  const ctx = AUDIO.ctx, t = ctx.currentTime + 0.02, dur = 0.18 + Math.random() * 0.35;
+  const f = ctx.createBiquadFilter();
+  f.type = 'lowpass'; f.frequency.value = 1400;
+  const g = ctx.createGain();
+  g.gain.setValueAtTime(0, t);
+  g.gain.linearRampToValueAtTime(level, t + 0.015);
+  g.gain.setValueAtTime(level, t + dur);
+  g.gain.linearRampToValueAtTime(0, t + dur + 0.04);
+  f.connect(g);
+  let out = g;
+  if (ctx.createStereoPanner){ const p = ctx.createStereoPanner(); p.pan.value = clamp(pan, -1, 1); g.connect(p); out = p; }
+  out.connect(AUDIO.n.master);
+  for (const hz of [340 + Math.random() * 60, 430 + Math.random() * 60]){
+    const o = ctx.createOscillator();
+    o.type = 'square'; o.frequency.value = hz;
+    o.connect(f); o.start(t); o.stop(t + dur + 0.1);
+  }
+}
+
+/* the mix, a few times a second ------------------------------ */
+const _ear = { rx: 1, ry: 0 };
+function updateAudio(now){
+  const A = AUDIO;
+  if (!A.ctx || A.ctx.state !== 'running' || now - A.lastMix < 100) return;
+  A.lastMix = now;
+  const ctx = A.ctx, n = A.n, t = ctx.currentTime, E = ENVSTATE;
+  const set = (param, v, tc) => param.setTargetAtTime(v, t, tc || 0.25);
+  set(n.master.gain, A.on ? A.vol * 0.9 : 0, 0.1);
+
+  /* the listener stands at the view's centre, facing up the screen */
+  const R = clamp(CAM.dist * 0.6, 25, 350);
+  _ear.rx = Math.cos(CAM.yaw); _ear.ry = -Math.sin(CAM.yaw);
+  const moving = SIM.running;
+  let tyres = 0, engine = 0, panW = 0, panS = 0, stopped = 0, stopPan = 0, near = 0;
+  let siren = 0, sirenPan = 0;
+  for (const v of SIM.vehicles){
+    if (!v.seg) continue;
+    const p = renderPose(v, 0), dx = p.x - CAM.x, dy = p.y - CAM.y, d2 = dx * dx + dy * dy;
+    if (d2 > 9 * R * R) continue;
+    const w = 1 / (1 + d2 / (R * R)), side = clamp((dx * _ear.rx + dy * _ear.ry) / R, -1, 1);
+    if (v.emerg){ const s = 1 / (1 + d2 / (4 * R * R)); if (s > siren){ siren = s; sirenPan = side; } }
+    if (!moving) continue;
+    near += w;
+    tyres += w * Math.min(v.v / 14, 1.6);
+    engine += w * (0.35 + Math.min(v.v / 20, 1));
+    panW += w * (0.2 + v.v / 14); panS += side * w * (0.2 + v.v / 14);
+    if (v.stopTime > 12 && d2 < R * R){ stopped++; stopPan = side; }
+  }
+  const close = 1 / (1 + CAM.dist / 350);               // detail fades as the camera pulls back
+  const pan = panW > 0 ? clamp(panS / panW, -0.8, 0.8) : 0;
+  set(n.tyres.g.gain, moving ? 0.65 * Math.min(Math.sqrt(tyres), 3) * close : 0);
+  set(n.engine.g.gain, moving ? 0.9 * Math.min(Math.sqrt(engine), 3) * close : 0);
+  if (n.tyres.p) set(n.tyres.p.pan, pan * 0.7);
+  if (n.engine.p) set(n.engine.p.pan, pan * 0.5);
+  set(n.engine.f.frequency, 90 + 60 * Math.min(near ? engine / near : 0, 1.5), 0.6);
+  const total = moving ? SIM.vehicles.length : 0;
+  set(n.rumble.g.gain, 1.2 * Math.sqrt(total / 250) * (0.35 + 0.65 * (1 - close)), 0.8);
+  const height = camera.position.y;
+  set(n.wind.g.gain, 0.05 + 0.25 * smoothstep(150, 3000, height) + 0.12 * E.rain, 1);
+  set(n.rain.g.gain, 0.25 * E.rain * (0.6 + 0.4 * close), 0.6);
+  set(n.siren.g.gain, moving ? 0.12 * siren : 0, 0.15);
+  if (n.siren.p) set(n.siren.p.pan, sirenPan * 0.8, 0.1);
+
+  /* one-shots: birds by day, crickets at night, a horn in a jam */
+  const s = now / 1000, calm = E.rain < 0.25;
+  if (calm && E.sunUp > 0.6 && CAM.dist < 700 && s > A.next.bird){
+    chirp(0.05 * close * (1 - E.dark), Math.random() * 1.6 - 0.8);
+    A.next.bird = s + 0.8 + Math.random() * 3.5;
+  }
+  if (calm && E.dark > 0.6 && CAM.dist < 900 && s > A.next.cricket){
+    cricket(0.035 * close, Math.random() * 1.6 - 0.8);
+    A.next.cricket = s + 0.4 + Math.random() * 1.4;
+  }
+  if (moving && stopped >= 4 && s > A.next.horn){
+    if (Math.random() < 0.35) horn(0.05 * close, stopPan);
+    A.next.horn = s + 6 + Math.random() * 14;
+  }
+}
 /* ============================================================
    7.5 · EDITOR
 
@@ -9291,6 +9555,9 @@ function setupControls(){
   bindTog('tClock', v => CFG.advanceClock = v);
   bindRange('sRain', v => CFG.rain = v, v => v === 0 ? 'Dry' : v < 35 ? `Light · ${v}%` : v < 70 ? `Steady · ${v}%` : `Heavy · ${v}%`);
   bindTog('tPeds', v => CFG.peds = v);
+  bindTog('tSound', v => setSound(v));
+  $('sVolume').value = Math.round(AUDIO.vol * 100);
+  bindRange('sVolume', v => setVolume(v / 100), v => `${v}%`);
 
   bindTog('tHeat', v => CFG.heat = v);
   bindTog('tDetect', v => CFG.detectors = v);
@@ -9372,7 +9639,7 @@ function syncControls(){
     tAdaptive: CFG.adaptive, tProtLeft: CFG.protLeft, tPreempt: CFG.preempt,
     tClock: CFG.advanceClock, tPeds: CFG.peds, tHeat: CFG.heat, tDetect: CFG.detectors,
     tBuild: CFG.buildings, tLights: CFG.headlights, tTrails: CFG.trails,
-    tShadows: CFG.shadows, tTrees: CFG.trees, tXray: CFG.xray, tDynRes: DYNRES.enabled,
+    tShadows: CFG.shadows, tTrees: CFG.trees, tXray: CFG.xray, tDynRes: DYNRES.enabled, tSound: AUDIO.on,
   };
   for (const k in togs){ const el = $(k); if (el) el.checked = togs[k]; }
 }
@@ -9690,6 +9957,7 @@ function setupPointer(){
     else if (k === 'z' && (e.metaKey || e.ctrlKey)){ e.preventDefault(); e.shiftKey ? doRedo() : doUndo(); }
     else if (k === 'y' && (e.metaKey || e.ctrlKey)){ e.preventDefault(); doRedo(); }
     else if (k === 'h'){ CFG.heat = !CFG.heat; $('tHeat').checked = CFG.heat; }
+    else if (k === 'm'){ setSound(!AUDIO.on); $('tSound').checked = AUDIO.on; toast(AUDIO.on ? 'Sound on' : 'Sound off'); }
     else if (k === 'q') rotateView(-Math.PI / 4);
     else if (k === 'e') rotateView(Math.PI / 4);
     else if (k === 't') togglePlanView();
@@ -10345,6 +10613,7 @@ function frameBody(now){
   } else cityDirtySince = 0;
 
   draw(dtReal);
+  updateAudio(now);
 
   statTimer -= dtReal;
   if (statTimer <= 0){
