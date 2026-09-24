@@ -185,7 +185,9 @@ input[type=range]:focus-visible{outline:none}
 input[type=range]:focus-visible::-webkit-slider-thumb{box-shadow:0 0 0 2px var(--blueprint)}
 
 /* toggle — modeled on a cabinet rocker switch */
-.tog{display:flex;align-items:center;justify-content:space-between;gap:10px;cursor:pointer;user-select:none}
+.tog{display:flex;align-items:center;justify-content:space-between;gap:10px;cursor:pointer;user-select:none;
+  position:relative}  /* keeps the hidden checkbox inside the scrolling panel: focusing it
+                         once scrolled the whole page off-screen, leaving it blank */
 .tog span.lb{font-size:11.5px;color:var(--paint-2)}
 .tog input{position:absolute;opacity:0;pointer-events:none}
 .tog .sw{
@@ -604,12 +606,24 @@ body.editing #view{cursor:crosshair}
             <div class="hint">Wet pavement cuts braking capability and desired speed.</div>
           </div>
           <label class="tog"><span class="lb">Pedestrians</span><input type="checkbox" id="tPeds" checked><span class="sw"></span></label>
+          <label class="tog"><span class="lb">Sound<kbd>M</kbd></span><input type="checkbox" id="tSound" checked><span class="sw"></span></label>
+          <div class="ctl">
+            <div class="ctl-top"><label for="sVolume">Volume</label><span class="val" id="vVolume">50%</span></div>
+            <input type="range" id="sVolume" min="0" max="100" step="1" value="50">
+          </div>
         </div>
       </div>
 
       <div class="sect" data-sect="view">
         <div class="sect-h"><span class="eyebrow">Display</span><span class="chev">▾</span></div>
         <div class="sect-b">
+          <div class="ctl">
+            <div class="ctl-top"><label>Graphics quality</label><span class="val" id="vQuality">Auto</span></div>
+            <div class="seg" id="qualitySeg">
+              <button data-q="auto">Auto</button><button data-q="low">Low</button><button data-q="medium">Med</button><button data-q="high">High</button><button data-q="ultra">Ultra</button>
+            </div>
+          </div>
+          <label class="tog"><span class="lb">Dynamic resolution</span><input type="checkbox" id="tDynRes" checked><span class="sw"></span></label>
           <div class="ctl">
             <div class="ctl-top"><label>Colour vehicles by</label></div>
             <div class="seg" id="colorSeg">
@@ -714,6 +728,7 @@ body.editing #view{cursor:crosshair}
                 <dt>WASD</dt><dd>Pan (arrow keys too)</dd>
                 <dt>C</dt><dd>Chase camera on the followed vehicle</dd>
                 <dt>H</dt><dd>Congestion heat map</dd>
+                <dt>M</dt><dd>Sound on or off</dd>
                 <dt>Esc</dt><dd>Clear selection</dd>
                 <dt>?</dt><dd>This panel</dd>
               </dl>
@@ -4287,7 +4302,7 @@ function pxPerMetre(wx, wy, h){
 }
 
 function resize(){
-  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  DPR = Math.min(window.devicePixelRatio || 1, Q.dprMax);
   const r = cv.getBoundingClientRect();
   VW = Math.max(1, r.width); VH = Math.max(1, r.height);
   renderer.setPixelRatio(DPR);
@@ -4465,6 +4480,17 @@ const TEX_FACADE = canvasTex(512, 512, (x, w, h) => {
   x.fillStyle = 'rgba(0,0,0,.07)';
   for (let j = 0; j < 8; j++) x.fillRect(0, j * ch + ch - 3, w, 3);
 });
+/* glass is glossy and the wall is not (linear data, read as roughness) */
+const TEX_FACADE_ROUGH = canvasTex(512, 512, (x, w, h) => {
+  x.fillStyle = '#e0e0e0'; x.fillRect(0, 0, w, h);
+  const R = mulberry32(77), cw = w / 8, ch = h / 8;
+  for (let j = 0; j < 8; j++) for (let i = 0; i < 8; i++){
+    const x0 = i * cw + cw * 0.2, y0 = j * ch + ch * 0.2, ww = cw * 0.6, hh = ch * 0.58;
+    const v = Math.round((0.08 + R() * 0.14) * 255);
+    x.fillStyle = `rgb(${v},${v},${v})`;
+    x.fillRect(x0, y0, ww, hh);
+  }
+}, false);
 const TEX_FACADE_LIT = canvasTex(512, 512, (x, w, h) => {
   x.fillStyle = '#000'; x.fillRect(0, 0, w, h);
   const R = mulberry32(52), cw = w / 8, ch = h / 8;
@@ -4508,15 +4534,32 @@ TEX_BEAM.wrapS = TEX_BEAM.wrapT = THREE.ClampToEdgeWrapping;
 /* ------------------------------------------------------------
    Materials
    ------------------------------------------------------------ */
+
+/* Several features rewrite the built-in shaders — see-through
+   buildings, the atmosphere, light effects.  The rewrites stack, in
+   the order they were added, and a material's compiled program is
+   keyed by the list it carries. */
+function shaderPatch(mat, key, fn){
+  const list = mat._patches || (mat._patches = []);
+  if (list.some(p => p.key === key)) return mat;
+  list.push({ key, fn });
+  mat.onBeforeCompile = (sh, r) => { for (const p of list) p.fn(sh, r); };
+  mat.customProgramCacheKey = () => list.map(p => p.key).join('+');
+  mat.needsUpdate = true;
+  return mat;
+}
 const ROAD_DRY = C3('#5b6068'), ROAD_WET = C3('#34383f');
 const WALK_DRY = C3('#a3a7ad'), WALK_WET = C3('#767b82');
 
 const MAT = {
-  /* The open ground is a backdrop: drawn first and never writing
-     depth, so nothing can lose a depth test to it.  A single quad
-     kilometres across cannot resolve a few centimetres near the
-     camera, and at a low angle it used to bleed through the road. */
-  ground: new THREE.MeshStandardMaterial({ color: C3('#66725a'), map: TEX_GROUND, roughness: 1, depthWrite: false }),
+  /* The open ground is a backdrop, drawn after the rest of the solid
+     scene so only the patches left showing are shaded, pushed back in
+     depth so nothing can lose a depth test to it, and never writing
+     depth.  A single quad kilometres across cannot resolve a few
+     centimetres near the camera, and at a low angle it used to bleed
+     through the road. */
+  ground: new THREE.MeshStandardMaterial({ color: C3('#66725a'), map: TEX_GROUND, roughness: 1, depthWrite: false,
+            polygonOffset: true, polygonOffsetFactor: 2, polygonOffsetUnits: 8 }),
   park:   new THREE.MeshStandardMaterial({ color: C3('#5f8150'), map: TEX_GRASS, roughness: 1 }),
   road:   new THREE.MeshStandardMaterial({ color: ROAD_DRY.clone(), map: TEX_ASPHALT, roughness: 0.92 }),
   walk:   new THREE.MeshStandardMaterial({ color: WALK_DRY.clone(), map: TEX_PAVER, roughness: 0.94 }),
@@ -4525,7 +4568,7 @@ const MAT = {
             polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -4 }),
   paintFine: new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.62, transparent: true,
             polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -4 }),
-  facade: new THREE.MeshStandardMaterial({ vertexColors: true, map: TEX_FACADE, roughness: 0.8, metalness: 0.04,
+  facade: new THREE.MeshStandardMaterial({ vertexColors: true, map: TEX_FACADE, roughness: 1, roughnessMap: TEX_FACADE_ROUGH, metalness: 0.04,
             emissive: C3('#ffc98a'), emissiveMap: TEX_FACADE_LIT, emissiveIntensity: 0 }),
   roof:   new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.96 }),
   metal:  new THREE.MeshStandardMaterial({ color: C3('#4a5059'), roughness: 0.55, metalness: 0.5 }),
@@ -4556,7 +4599,7 @@ const XRAY = {
   uCamPos: { value: new THREE.Vector3() }, uTarget: { value: new THREE.Vector3() }, uXray: { value: 0 },
 };
 function xrayMaterial(mat){
-  mat.onBeforeCompile = sh => {
+  return shaderPatch(mat, 'xray', sh => {
     Object.assign(sh.uniforms, XRAY);
     sh.vertexShader = 'varying vec3 vXw;\n' + sh.vertexShader.replace('#include <begin_vertex>',
       '#include <begin_vertex>\n  vXw = (modelMatrix * vec4(transformed, 1.0)).xyz;');
@@ -4574,8 +4617,7 @@ float xbayer(vec2 p){ p = floor(p); return (4.0 * xb2(mod(p, 2.0)) + xb2(mod(flo
       if (k > xbayer(gl_FragCoord.xy)) discard;
     }
   }`);
-  };
-  mat.customProgramCacheKey = () => 'xray';
+  });
 }
 xrayMaterial(MAT.facade);
 xrayMaterial(MAT.roof);
@@ -4890,6 +4932,7 @@ class InstPool {
     im.castShadow = !!this.opts.cast;
     im.receiveShadow = !!this.opts.receive;
     im.renderOrder = this.opts.order || 0;
+    if (this.opts.layer) im.layers.set(this.opts.layer);
     im.count = 0;
     if (old){
       im.instanceMatrix.array.set(old.instanceMatrix.array.subarray(0, Math.min(old.instanceMatrix.array.length, cap * 16)));
@@ -4965,79 +5008,793 @@ const GEO_FLAT = new THREE.PlaneGeometry(1, 1).rotateX(-Math.PI / 2);           
 const GEO_DISC = new THREE.CylinderGeometry(0.5, 0.5, 1, 16).rotateZ(Math.PI / 2);     // lens facing ±x
 
 /* ------------------------------------------------------------
-   Environment: sky, sun and moon, fog, ground
+   Graphics quality
 
-   Darkness still comes from nightF(), exactly as in 2D, so the
-   scenarios and the clock behave the same — it now also drives a
-   sun that crosses the sky, a moon, lit windows and street lamps.
+   Every graphics feature reads its settings from Q, the active
+   preset, so a single switch trades looks for speed.  "Auto" picks
+   a preset from what the device says about itself; an explicit
+   choice is remembered per browser.  Features that need to rebuild
+   something when the preset changes register a hook.
+   ------------------------------------------------------------ */
+const QUALITY_LEVELS = ['low', 'medium', 'high', 'ultra'];
+const QUALITY = {
+  low:    { name: 'Low',    dprMax: 1,   shadowSize: 1024, shadowFarSize: 1024, cascades: 1, post: false, msaa: 0, cloudShadows: false, ibl: false, bloom: 0, ao: 0 },
+  medium: { name: 'Medium', dprMax: 1.5, shadowSize: 2048, shadowFarSize: 1024, cascades: 2, post: true,  msaa: 2, cloudShadows: true, ibl: true, bloom: 5, ao: 8 },
+  high:   { name: 'High',   dprMax: 2,   shadowSize: 2048, shadowFarSize: 2048, cascades: 2, post: true,  msaa: 4, cloudShadows: true, ibl: true, bloom: 6, ao: 12 },
+  ultra:  { name: 'Ultra',  dprMax: 2,   shadowSize: 4096, shadowFarSize: 2048, cascades: 2, post: true,  msaa: 4, cloudShadows: true, ibl: true, bloom: 7, ao: 16 },
+};
+const QUALITY_HOOKS = [];
+let qualityChoice = 'auto';
+let qualityAuto = 'medium';
+let Q = QUALITY.medium;
+
+/* What the device can probably sustain.  Coarse on purpose — the
+   dynamic resolution fine-tunes from there — and never Ultra, which
+   is for someone who asks for it. */
+function detectQuality(){
+  let gpu = '';
+  try {
+    const gl = renderer.getContext();
+    const ext = gl.getExtension('WEBGL_debug_renderer_info');
+    gpu = String(ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER) || '');
+  } catch (e) {}
+  const g = gpu.toLowerCase();
+  const coarse = !!(window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
+  const mem = navigator.deviceMemory || 8, cores = navigator.hardwareConcurrency || 4;
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const px = (screen.width || 1920) * (screen.height || 1080) * dpr * dpr;
+  if (/swiftshader|llvmpipe|softpipe|software|basic render/.test(g)) return 'low';
+  if (mem <= 2 || cores <= 2) return 'low';
+  if (coarse) return /apple gpu|adreno.*(7[3-9]\d|8\d\d)|mali-g(7[1-9]|[89]\d\d)|xclipse/.test(g) ? 'medium' : 'low';
+  if (/nvidia|geforce|rtx|gtx|quadro|radeon rx|radeon pro|arc\(tm\) a|arc a\d|apple m\d|apple gpu/.test(g)) return 'high';
+  if (/intel|iris|uhd|hd graphics|radeon\(tm\) graphics|radeon graphics|vega/.test(g)) return px > 5e6 ? 'low' : 'medium';
+  return 'medium';
+}
+
+function loadQualityChoice(){
+  try {
+    const v = localStorage.getItem('gridcontrol.quality');
+    if (v === 'auto' || QUALITY_LEVELS.includes(v)) return v;
+  } catch (e) {}
+  return 'auto';
+}
+
+/* switch preset; `choice` is 'auto' or a level */
+function setQuality(choice, save){
+  qualityChoice = choice === 'auto' || QUALITY_LEVELS.includes(choice) ? choice : 'auto';
+  const level = qualityChoice === 'auto' ? qualityAuto : qualityChoice;
+  Q = QUALITY[level];
+  Q.level = level;
+  if (save !== false){ try { localStorage.setItem('gridcontrol.quality', qualityChoice); } catch (e) {} }
+  if (typeof resize === 'function' && VW > 1) resize();
+  /* a new shadow map size takes effect when the old map is dropped */
+  if (typeof sun !== 'undefined' && sun.shadow.mapSize.x !== Q.shadowSize){
+    sun.shadow.mapSize.set(Q.shadowSize, Q.shadowSize);
+    if (sun.shadow.map){ sun.shadow.map.dispose(); sun.shadow.map = null; }
+  }
+  if (typeof sunFar !== 'undefined' && sunFar.shadow.mapSize.x !== Q.shadowFarSize){
+    sunFar.shadow.mapSize.set(Q.shadowFarSize, Q.shadowFarSize);
+    if (sunFar.shadow.map){ sunFar.shadow.map.dispose(); sunFar.shadow.map = null; }
+  }
+  for (const f of QUALITY_HOOKS) f(Q);
+  paintQualityControl();
+}
+
+function paintQualityControl(){
+  const seg = document.getElementById('qualitySeg');
+  if (!seg) return;
+  seg.querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.q === qualityChoice));
+  const v = document.getElementById('vQuality');
+  if (!v) return;
+  const scale = typeof POST !== 'undefined' && POST.scale < 1 ? ` · ${Math.round(POST.scale * 100)}%` : '';
+  v.textContent = (qualityChoice === 'auto' ? `Auto · ${QUALITY[qualityAuto].name}` : QUALITY[qualityChoice].name) + scale;
+}
+
+qualityAuto = detectQuality();
+qualityChoice = loadQualityChoice();
+Q = QUALITY[qualityChoice === 'auto' ? qualityAuto : qualityChoice];
+Q.level = qualityChoice === 'auto' ? qualityAuto : qualityChoice;
+
+/* ------------------------------------------------------------
+   Environment: sky, sun and moon, clouds, fog, ground
+
+   The sky is computed, not painted.  Sunlight (and at night
+   moonlight) scattered once by air and haze is integrated along
+   each view ray through a spherical atmosphere, plus a cheap
+   stand-in for light scattered more than once, which is what keeps
+   a twilight sky blue.  That runs on the GPU into a small panorama,
+   redrawn only when the sun has moved; the dome, the fog and the
+   clouds all read it, so the ground melts into the sky at any hour.
+   The same model runs in JavaScript for the few colours the lights
+   need.
+
+   Darkness still comes from nightF(), as in 2D, so the scenarios
+   keep their clock, except that in the evening it keeps up with the
+   sun (see updateEnvironment).
    ------------------------------------------------------------ */
 const hemi = new THREE.HemisphereLight(0xc9d7e8, 0x4a4740, 1.1);
 scene.add(hemi);
 const sun = new THREE.DirectionalLight(0xfff3e0, 2.4);
 sun.castShadow = true;
-sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.mapSize.set(Q.shadowSize, Q.shadowSize);
 sun.shadow.bias = -0.0002;
 scene.add(sun, sun.target);
-scene.fog = new THREE.Fog(0x9aabbd, 1500, 6000);
+/* The sun's shadow comes in two cascades: the map above covers what
+   is near the view's centre in fine detail, this one a wider area
+   ahead, coarser, so a view along a street still sees buildings far
+   off cast shadows.  This light gives no light of its own — the lit
+   shaders take only its shadow map (see CSM_BLOCK). */
+const sunFar = new THREE.DirectionalLight(0xffffff, 0);
+sunFar.castShadow = true;
+sunFar.shadow.mapSize.set(Q.shadowFarSize || 1024, Q.shadowFarSize || 1024);
+sunFar.shadow.bias = -0.0003;
+sunFar.visible = false;
+scene.add(sunFar, sunFar.target);
 
 const ENV = {
-  zenD: C3('#5f86b3'), horD: C3('#b9c8d6'),
-  zenN: C3('#04070e'), horN: C3('#121c2d'),
-  horDusk: C3('#d9976a'),
-  sunHi: C3('#fff2dc'), sunLo: C3('#ffac66'), moon: C3('#94abdc'),
-  hemiSkyD: C3('#cbd8e6'), hemiGndD: C3('#4e4a42'),
+  moon: C3('#94abdc'), moonDisc: C3('#dfe7f5'),
   hemiSkyN: C3('#34466e'), hemiGndN: C3('#101117'),
-  rainD: C3('#7c8793'), rainN: C3('#0e131b'),
-  groundD: C3('#4b5245'), groundN: C3('#4b5245'),
+  cityGlow: C3('#ff9d52'), overcast: C3('#c9d1da'),
+  groundAlbedo: C3('#3a3d33'),
 };
-const ENVSTATE = { dark: 0, rain: 0, sunUp: 1, dir: new THREE.Vector3(0.4, 0.8, 0.3), moonDir: new THREE.Vector3(-0.35, 0.82, -0.45).normalize() };
+/* The moon hangs low in the east-south-east, where a view along the
+   streets can see it; its light comes from the same bearing but from
+   high up, so night shadows stay short and the map stays readable. */
+const MOON_AZ = 0.35;
+const moonAt = el => new THREE.Vector3(Math.cos(MOON_AZ) * Math.cos(el), Math.sin(el), Math.sin(MOON_AZ) * Math.cos(el));
+const ENVSTATE = { dark: 0, rain: 0, sunUp: 1, dir: new THREE.Vector3(0.4, 0.8, 0.3), moonDir: moonAt(0.95), moonSky: moonAt(0.12) };
 
-/* sky dome: horizon-to-zenith gradient, a sun, and stars at night */
-const skyMat = new THREE.ShaderMaterial({
-  uniforms: {
-    uTop: { value: new THREE.Color() }, uHor: { value: new THREE.Color() }, uBot: { value: new THREE.Color() },
-    uSunDir: { value: new THREE.Vector3(0, 1, 0) }, uSunCol: { value: new THREE.Color() }, uStars: { value: 0 },
-  },
-  vertexShader: `
-    varying vec3 vDir;
-    void main(){
-      vDir = position;
-      vec4 p = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-      gl_Position = p.xyww;
-    }`,
-  fragmentShader: `
-    uniform vec3 uTop, uHor, uBot, uSunCol, uSunDir;
-    uniform float uStars;
-    varying vec3 vDir;
-    float hash(vec3 p){ p = fract(p * 0.3183099 + 0.1); p *= 17.0; return fract(p.x * p.y * p.z * (p.x + p.y + p.z)); }
-    void main(){
-      vec3 d = normalize(vDir);
-      float h = d.y;
-      vec3 col = h > 0.0 ? mix(uHor, uTop, pow(clamp(h, 0.0, 1.0), 0.5))
-                         : mix(uHor, uBot, clamp(-h * 5.0, 0.0, 1.0));
-      float s = max(dot(d, normalize(uSunDir)), 0.0);
-      col += uSunCol * (pow(s, 1400.0) * 4.0 + pow(s, 14.0) * 0.16);
-      if (uStars > 0.0 && h > 0.02){
-        vec3 q = floor(d * 380.0);
-        float st = step(0.9982, hash(q)) * (0.4 + 0.6 * hash(q + 7.0));
-        col += vec3(0.85, 0.9, 1.0) * st * uStars * smoothstep(0.02, 0.25, h);
+/* ---- the atmosphere model ---- */
+const ATM = {
+  RE: 6360e3, RA: 6420e3, VIEW_H: 150,
+  BR: [5.802e-6, 13.558e-6, 33.1e-6],       // air (Rayleigh) scattering per metre
+  BO: [0.650e-6, 1.881e-6, 0.085e-6],       // ozone absorption
+  BM: 21e-6, G: 0.76,                        // haze (Mie) scattering, forward lobe
+  KMS: 0.7, LIFT: 0.12,                      // multiple-scattering stand-in
+  GAIN: 12, SAT: 1.3,                        // model units → scene light, a little extra blue
+  MOON_E: 0.045, MOON_TINT: [0.72, 0.85, 1.0],
+  SUN_I: 2.9,                                // key light at noon
+  CLOUD_H: 2400, CLOUD_TILE: 9000, WIND: [6.5, 2.4],
+  sun: new THREE.Vector3(0, 1, 0),
+  key: null, enc: 1, lut: null, lutFloat: false, lutDirty: true,
+  T: [1, 1, 1], Tc: [1, 1, 1], TL: 1, skyAvg: new THREE.Color(), zenith: new THREE.Color(), horizon: new THREE.Color(),
+};
+
+function atmSphFar(o, d, r){
+  const b = o[0] * d[0] + o[1] * d[1] + o[2] * d[2];
+  const D = b * b - (o[0] * o[0] + o[1] * o[1] + o[2] * o[2] - r * r);
+  return D < 0 ? -1 : -b + Math.sqrt(D);
+}
+function atmBelow(o, d){
+  const b = o[0] * d[0] + o[1] * d[1] + o[2] * d[2];
+  const D = b * b - (o[0] * o[0] + o[1] * o[1] + o[2] * o[2] - ATM.RE * ATM.RE);
+  return D > 0 && -b - Math.sqrt(D) > 0;
+}
+function atmDens(p, out){
+  const h = Math.hypot(p[0], p[1], p[2]) - ATM.RE;
+  out[0] = Math.exp(-h / 8000); out[1] = Math.exp(-h / 1200); out[2] = Math.max(0, 1 - Math.abs(h - 25000) / 15000);
+  return out;
+}
+const _ad = [0, 0, 0], _aq = [0, 0, 0];
+function atmLightDepth(p, l, n, out){
+  const ds = atmSphFar(p, l, ATM.RA) / n;
+  out[0] = out[1] = out[2] = 0;
+  for (let j = 0; j < n; j++){
+    const s = ds * (j + 0.5);
+    _aq[0] = p[0] + l[0] * s; _aq[1] = p[1] + l[1] * s; _aq[2] = p[2] + l[2] * s;
+    atmDens(_aq, _ad);
+    out[0] += _ad[0] * ds; out[1] += _ad[1] * ds; out[2] += _ad[2] * ds;
+  }
+  return out;
+}
+function atmPhaseR(mu){ return 0.0596831 * (1 + mu * mu); }
+function atmPhaseM(mu){
+  const g = ATM.G, g2 = g * g;
+  return 0.1193662 * (1 - g2) * (1 + mu * mu) / ((2 + g2) * Math.pow(1 + g2 - 2 * g * mu, 1.5));
+}
+/* raw radiance toward d (unit, array) — the GPU panorama runs the same sums */
+const _ao = [0, 0, 0], _ap = [0, 0, 0], _al = [0, 0, 0], _dn = [0, 0, 0];
+function atmScatter(d, s, out){
+  const RE = ATM.RE, BR = ATM.BR, BO = ATM.BO, bm = s.bm;
+  const ro = [0, RE + ATM.VIEW_H, 0];
+  const tMax = atmSphFar(ro, d, ATM.RA);
+  const sR = [0, 0, 0], sM = [0, 0, 0], mR = [0, 0, 0], mM = [0, 0, 0], ms = [0, 0, 0];
+  const od = [0, 0, 0];
+  let tp = 0;
+  const N = 16;
+  const mu = d[0] * s.sun[0] + d[1] * s.sun[1] + d[2] * s.sun[2], fms = (0.5 + 0.5 * mu) * (0.5 + 0.5 * mu);
+  for (let i = 0; i < N; i++){
+    const f = (i + 1) / N, t1 = tMax * f * f, ds = t1 - tp, tm = 0.5 * (tp + t1);
+    tp = t1;
+    _ap[0] = d[0] * tm; _ap[1] = ro[1] + d[1] * tm; _ap[2] = d[2] * tm;
+    atmDens(_ap, _dn);
+    _dn[0] *= ds; _dn[1] *= ds; _dn[2] *= ds;
+    _ao[0] = od[0] + 0.5 * _dn[0]; _ao[1] = od[1] + 0.5 * _dn[1]; _ao[2] = od[2] + 0.5 * _dn[2];
+    if (s.sunE > 0 && !atmBelow(_ap, s.sun)){
+      atmLightDepth(_ap, s.sun, 6, _al);
+      for (let c = 0; c < 3; c++){
+        const a = Math.exp(-(BR[c] * (_ao[0] + _al[0]) + bm * 1.11 * (_ao[1] + _al[1]) + BO[c] * (_ao[2] + _al[2])));
+        sR[c] += a * _dn[0]; sM[c] += a * _dn[1];
       }
-      gl_FragColor = vec4(col, 1.0);
+    }
+    if (s.kms > 0 && !atmBelow(_ap, s.lift)){
+      atmLightDepth(_ap, s.lift, 6, _al);
+      const tg = Math.exp(-(BR[1] * 0.5 * _al[0] + bm * 1.11 * 0.5 * _al[1] + BO[1] * _al[2]));
+      for (let c = 0; c < 3; c++){
+        const tl = Math.exp(-(BR[c] * 0.5 * _al[0] + bm * 1.11 * 0.5 * _al[1] + BO[c] * _al[2]));
+        const tv = Math.exp(-(BR[c] * _ao[0] + bm * 1.11 * _ao[1] + BO[c] * _ao[2]));
+        ms[c] += tv * (tg + (tl - tg) * fms) * (BR[c] * _dn[0] + bm * _dn[1]);
+      }
+    }
+    if (s.moonE > 0 && !atmBelow(_ap, s.moon)){
+      atmLightDepth(_ap, s.moon, 6, _al);
+      for (let c = 0; c < 3; c++){
+        const a = Math.exp(-(BR[c] * (_ao[0] + _al[0]) + bm * 1.11 * (_ao[1] + _al[1]) + BO[c] * (_ao[2] + _al[2])));
+        mR[c] += a * _dn[0]; mM[c] += a * _dn[1];
+      }
+    }
+    od[0] += _dn[0]; od[1] += _dn[1]; od[2] += _dn[2];
+  }
+  const mm = d[0] * s.moon[0] + d[1] * s.moon[1] + d[2] * s.moon[2];
+  const pR = atmPhaseR(mu), pM = atmPhaseM(mu), qR = atmPhaseR(mm), qM = atmPhaseM(mm);
+  const w = 0.0795775 * (0.7 + 0.3 * mu);
+  for (let c = 0; c < 3; c++){
+    out[c] = s.sunE * (sR[c] * BR[c] * pR + sM[c] * bm * pM + s.kms * ms[c] * w)
+           + s.moonE * ATM.MOON_TINT[c] * (mR[c] * BR[c] * qR + mM[c] * bm * qM);
+  }
+  return out;
+}
+/* sunlight left after crossing the air, from height h0 */
+function atmTransmittance(sunDir, bm, h0, out){
+  const ro = [0, ATM.RE + h0, 0];
+  if (atmBelow(ro, sunDir)){ out[0] = out[1] = out[2] = 0; return out; }
+  atmLightDepth(ro, sunDir, 24, _al);
+  for (let c = 0; c < 3; c++) out[c] = Math.exp(-(ATM.BR[c] * _al[0] + bm * 1.11 * _al[1] + ATM.BO[c] * _al[2]));
+  return out;
+}
+const lum3 = (r, g, b) => 0.2126 * r + 0.7152 * g + 0.0722 * b;
+
+/* A tileable cloud field: two independent value-noise fBm layers,
+   histogram-flattened so "coverage" reads as a share of the sky. */
+function makeCloudTexture(N){
+  let seed = 20240917;
+  const rnd = () => ((seed = (seed * 1664525 + 1013904223) >>> 0) / 4294967296);
+  const data = new Uint8Array(N * N * 4);
+  for (let ch = 0; ch < 2; ch++){
+    const out = new Float32Array(N * N);
+    let amp = 1;
+    for (const P of [4, 8, 16, 32, 64]){
+      const L = new Float32Array(P * P);
+      for (let i = 0; i < L.length; i++) L[i] = rnd();
+      const s = P / N;
+      for (let y = 0; y < N; y++){
+        const fy = y * s, y0 = Math.floor(fy), ty = fy - y0, wy = ty * ty * ty * (ty * (ty * 6 - 15) + 10);
+        const r0 = (y0 % P) * P, r1 = ((y0 + 1) % P) * P;
+        for (let x = 0; x < N; x++){
+          const fx = x * s, x0 = Math.floor(fx), tx = fx - x0, wx = tx * tx * tx * (tx * (tx * 6 - 15) + 10);
+          const c0 = x0 % P, c1 = (x0 + 1) % P;
+          const a = L[r0 + c0] + (L[r0 + c1] - L[r0 + c0]) * wx;
+          const b = L[r1 + c0] + (L[r1 + c1] - L[r1 + c0]) * wx;
+          out[y * N + x] += (a + (b - a) * wy) * amp;
+        }
+      }
+      amp *= 0.5;
+    }
+    let lo = Infinity, hi = -Infinity;
+    for (const v of out){ if (v < lo) lo = v; if (v > hi) hi = v; }
+    const B = 4096, hist = new Uint32Array(B + 1);
+    for (let i = 0; i < out.length; i++) hist[Math.round((out[i] - lo) / (hi - lo) * B)]++;
+    for (let i = 1; i <= B; i++) hist[i] += hist[i - 1];
+    for (let i = 0; i < out.length; i++) data[i * 4 + ch] = Math.round(hist[Math.round((out[i] - lo) / (hi - lo) * B)] / out.length * 255);
+  }
+  for (let i = 0; i < N * N; i++) data[i * 4 + 3] = 255;
+  const t = new THREE.DataTexture(data, N, N);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.magFilter = THREE.LinearFilter;
+  t.minFilter = THREE.LinearMipmapLinearFilter;
+  t.generateMipmaps = true;
+  t.needsUpdate = true;
+  return t;
+}
+
+/* uniforms every atmospheric shader shares (one set of objects) */
+const ATMU = {
+  tSkyLut: { value: null }, uLutScale: { value: 1 }, uSkySat: { value: ATM.SAT },
+  uOvercast: { value: 0 }, uOvercastCol: { value: new THREE.Color() }, uCityGlow: { value: new THREE.Color(0, 0, 0) },
+  uFog: { value: new THREE.Vector4(0.00012, 1 / 150, 11000, 0.03) },   // density, falloff, far, horizon
+  tCloud: { value: makeCloudTexture(256) }, uCloud: { value: new THREE.Vector4(0, 0, 0.4, 0) },  // drift, cover, shade
+  uCloudH: { value: ATM.CLOUD_H }, uCloudInvTile: { value: 1 / ATM.CLOUD_TILE },
+  uShadowDir: { value: new THREE.Vector3(0, 1, 0) },
+  uFogK: { value: [0, 1, 2, 3, 4].map(() => new THREE.Vector3()) }, uSunH: { value: new THREE.Vector2(1, 0) },
+};
+
+/* Fog is exponential in height: thick in the streets, thin above
+   the towers, so a view from above stays clear while a view along
+   the ground fades into the horizon.  Density integrates exactly
+   along the ray, plus a haze that grows with the square of the
+   distance so the ground has fully faded by the far plane and never
+   ends against the sky. */
+const GLSL_ATM_FOG = `
+  uniform vec4 uFog;
+  float atmFogAmount(vec3 w){
+    vec3 r = w - cameraPosition;
+    float L = length(r);
+    float bd = uFog.y * r.y;
+    float k = abs(bd) > 1e-3 ? (1.0 - exp(-bd)) / bd : 1.0 - 0.5 * bd;
+    float q = max(L / uFog.z - 0.25, 0.0) * 1.3333;
+    float od = uFog.x * L * exp(-uFog.y * cameraPosition.y) * k + 3.0 * q * q;
+    return max(1.0 - exp(-od), smoothstep(uFog.z * 0.9, uFog.z, L));
+  }`;
+const GLSL_ATM = GLSL_ATM_FOG + `
+  uniform sampler2D tSkyLut, tCloud;
+  uniform float uLutScale, uSkySat, uOvercast, uCloudH, uCloudInvTile;
+  uniform vec3 uOvercastCol, uCityGlow, uShadowDir;
+  uniform vec4 uCloud;
+  uniform vec3 uFogK[5];
+  uniform vec2 uSunH;
+  /* the horizon's colour around the compass, as a curve in the angle
+     to the sun fitted to the panorama; it is the colour of the fog */
+  vec3 atmHorizon(vec2 h){
+    float c = dot(h, uSunH) * inversesqrt(max(dot(h, h), 1e-8));
+    float p = max(c, 0.0), p8 = p * p;
+    p8 *= p8; p8 *= p8;
+    float p32 = p8 * p8;
+    p32 *= p32;
+    return max(uFogK[0] + uFogK[1] * c + uFogK[2] * (c * c) + uFogK[3] * p8 + uFogK[4] * p32, 0.0) + uCityGlow * 0.657;
+  }
+  vec3 atmSky(vec3 d){
+    vec2 h = d.xz;
+    if (dot(h, h) < 1e-8) h = vec2(1.0, 0.0);
+    float el = asin(clamp(d.y, -1.0, 1.0));
+    vec3 hz = atmHorizon(h);
+    if (el <= uFog.w) return hz;
+    vec3 e = texture2D(tSkyLut, vec2(atan(h.y, h.x) * 0.1591549 + 0.5, sqrt(el * 0.6366198))).rgb;
+    vec3 c = e * e * uLutScale;
+    float k = smoothstep(0.0, 0.35, el);
+    c *= mix(vec3(0.98, 0.92, 1.03), vec3(1.0), k);
+    float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
+    c = max(vec3(l) + (c - vec3(l)) * mix(1.0, uSkySat, k), 0.0);
+    c = mix(c, uOvercastCol * (0.62 + 0.38 * sin(el)), uOvercast);
+    return mix(hz, c + uCityGlow * exp(-el * 14.0), smoothstep(uFog.w, uFog.w + 0.05, el));
+  }
+  vec3 atmFogColor(vec3 w){ return atmHorizon(w.xz - cameraPosition.xz); }
+  /* the broad shape of the clouds; detail only roughens their edges,
+     so shadows on the ground can do with the shape alone */
+  float atmCloudShape(vec2 p){ return texture2D(tCloud, p * uCloudInvTile + uCloud.xy).r; }
+  float atmCloudDensity(vec2 p){
+    vec2 q = p * uCloudInvTile + uCloud.xy;
+    float n = texture2D(tCloud, q).r - 0.3 * (texture2D(tCloud, q * 2.73 + vec2(0.31, 0.77)).g - 0.5);
+    float t = 1.0 - uCloud.z;
+    return smoothstep(t, t + 0.2, n);
+  }
+  float atmCloudShadow(vec3 w){
+    if (uCloud.w <= 0.0) return 1.0;
+    vec3 s = uShadowDir;
+    float t = 1.0 - uCloud.z;
+    return 1.0 - uCloud.w * smoothstep(t, t + 0.25, atmCloudShape(w.xz + s.xz * ((uCloudH - w.y) / max(s.y, 0.15))));
+  }`;
+
+/* Fog, and on lit surfaces the passing shadows of clouds, are
+   spliced into the stock materials.  'lit' for surfaces the sun
+   lights, 'basic' for flat colour, 'add' for light that is added
+   on top (it fades out rather than toward the fog colour). */
+const ATM_VERT = `#include <project_vertex>
+  {
+    vec4 aw = vec4(transformed, 1.0);
+    #ifdef USE_INSTANCING
+      aw = instanceMatrix * aw;
+    #endif
+    vAtmW = (modelMatrix * aw).xyz;
+  }`;
+const ATM_DIR_HOOK = 'getDirectionalLightInfo( directionalLight, directLight );';
+const CSM_FROM = '#if ( NUM_DIR_LIGHTS > 0 ) && defined( RE_Direct )';
+const CSM_TO = '#if ( NUM_RECT_AREA_LIGHTS > 0 ) && defined( RE_Direct_RectArea )';
+const CSM_BLOCK = `#if ( NUM_DIR_LIGHTS > 0 ) && defined( RE_Direct )
+	DirectionalLight directionalLight = directionalLights[ 0 ];
+	getDirectionalLightInfo( directionalLight, directLight );
+	directLight.color *= atmCS;
+	#if defined( USE_SHADOWMAP ) && NUM_DIR_LIGHT_SHADOWS > 0
+	if ( directLight.visible && receiveShadow ) {
+		DirectionalLightShadow sn = directionalLightShadows[ 0 ];
+		float sh = getShadow( directionalShadowMap[ 0 ], sn.shadowMapSize, sn.shadowIntensity, sn.shadowBias, sn.shadowRadius, vDirectionalShadowCoord[ 0 ] );
+		#if NUM_DIR_LIGHT_SHADOWS > 1
+		vec2 cn = vDirectionalShadowCoord[ 0 ].xy / vDirectionalShadowCoord[ 0 ].w;
+		vec2 en = min( cn, 1.0 - cn );
+		float inNear = smoothstep( 0.0, 0.08, min( en.x, en.y ) );
+		if ( inNear < 1.0 ) {
+			DirectionalLightShadow sf = directionalLightShadows[ 1 ];
+			sh = mix( getShadow( directionalShadowMap[ 1 ], sf.shadowMapSize, sf.shadowIntensity, sf.shadowBias, sf.shadowRadius, vDirectionalShadowCoord[ 1 ] ), sh, inNear );
+		}
+		#endif
+		directLight.color *= sh;
+	}
+	#endif
+	RE_Direct( directLight, geometryPosition, geometryNormal, geometryViewDir, geometryClearcoatNormal, material, reflectedLight );
+#endif
+`;
+/* the stock chunk as expected: the cascade split can replace its sun */
+const CSM_OK = (() => {
+  const lb = THREE.ShaderChunk.lights_fragment_begin, a = lb.indexOf(CSM_FROM), b = lb.indexOf(CSM_TO);
+  return a >= 0 && b > a;
+})();
+function atmospherePatch(mat, mode){
+  return shaderPatch(mat, 'atm-' + mode, sh => {
+    Object.assign(sh.uniforms, ATMU);
+    sh.vertexShader = 'varying vec3 vAtmW;\n' + sh.vertexShader.replace('#include <project_vertex>', ATM_VERT);
+    let fs = sh.fragmentShader;
+    const lb = THREE.ShaderChunk.lights_fragment_begin;
+    if (mode === 'lit' && CSM_OK){
+      const a = lb.indexOf(CSM_FROM), b = lb.indexOf(CSM_TO);
+      fs = fs.replace('#include <lights_fragment_begin>', 'float atmCS = atmCloudShadow(vAtmW);\n'
+        + lb.slice(0, a) + CSM_BLOCK + lb.slice(b));
+    } else if (mode === 'lit' && lb.includes(ATM_DIR_HOOK))
+      fs = fs.replace('#include <lights_fragment_begin>', 'float atmCS = atmCloudShadow(vAtmW);\n'
+        + lb.replace(ATM_DIR_HOOK, ATM_DIR_HOOK + '\n\t\tdirectLight.color *= atmCS;'));
+    /* the captured sky is used for reflections only, and only where the
+       surface is smooth enough to show one; diffuse sky light comes
+       from the hemisphere light, which is far cheaper */
+    if (mode === 'lit')
+      fs = fs.replace('#include <lights_fragment_maps>', THREE.ShaderChunk.lights_fragment_maps
+        .replace('iblIrradiance += getIBLIrradiance( geometryNormal );', '')
+        .replace('radiance += getIBLRadiance( geometryViewDir, geometryNormal, material.roughness );',
+                 'if ( material.roughness < 0.7 ) radiance += getIBLRadiance( geometryViewDir, geometryNormal, material.roughness );'));
+    fs = fs.replace('#include <tonemapping_fragment>', (mode === 'add'
+      ? 'gl_FragColor.rgb *= 1.0 - atmFogAmount(vAtmW);\n'
+      : 'gl_FragColor.rgb = mix(gl_FragColor.rgb, atmFogColor(vAtmW), atmFogAmount(vAtmW));\n') + '#include <tonemapping_fragment>');
+    sh.fragmentShader = 'varying vec3 vAtmW;\n' + GLSL_ATM + '\n' + fs;
+  });
+}
+for (const k in MAT) atmospherePatch(MAT[k], MAT[k].isMeshStandardMaterial ? 'lit' : 'basic');
+
+/* Rain leaves a film on the asphalt and pools in its hollows: the
+   film darkens it and takes the edge off its roughness, the pools
+   are near mirrors.  Where they lie comes from the cloud noise, laid
+   out in world space. */
+const WET = { uWet: { value: 0 } };
+shaderPatch(MAT.road, 'wet', sh => {
+  Object.assign(sh.uniforms, WET);
+  sh.fragmentShader = 'uniform float uWet;\n' + sh.fragmentShader.replace('#include <roughnessmap_fragment>', `#include <roughnessmap_fragment>
+  if (uWet > 0.0){
+    float pool = smoothstep(0.84, 0.92, texture2D(tCloud, vAtmW.xz * 0.045).g + 0.06 * uWet)
+               * smoothstep(0.35, 0.6, texture2D(tCloud, vAtmW.xz * 0.011 + 0.5).r);
+    roughnessFactor = mix(roughnessFactor, mix(0.62, 0.04, pool), uWet);
+    diffuseColor.rgb *= mix(1.0, mix(0.82, 0.5, pool), uWet);
+  }`);
+});
+
+/* ---- the sky panorama: azimuth across, elevation up (squared, so
+   the horizon, where colour changes fastest, gets most rows) ---- */
+const SKYLUT = {
+  W: 128, H: 64,
+  cam: new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1),
+  scene: new THREE.Scene(),
+  mat: new THREE.ShaderMaterial({
+    uniforms: {
+      uSun: { value: new THREE.Vector3() }, uLift: { value: new THREE.Vector3() }, uMoon: { value: ENVSTATE.moonSky },
+      uSunE: { value: 1 }, uMoonE: { value: 0 }, uKms: { value: ATM.KMS }, uBM: { value: ATM.BM }, uEnc: { value: 1 },
+      uMoonTint: { value: new THREE.Vector3(...ATM.MOON_TINT) },
+    },
+    vertexShader: `
+      varying vec2 vUv;
+      void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`,
+    fragmentShader: `
+      varying vec2 vUv;
+      uniform vec3 uSun, uLift, uMoon, uMoonTint;
+      uniform float uSunE, uMoonE, uKms, uBM, uEnc;
+      #define RE 6360e3
+      #define RA 6420e3
+      const vec3 BR = vec3(5.802e-6, 13.558e-6, 33.1e-6);
+      const vec3 BO = vec3(0.650e-6, 1.881e-6, 0.085e-6);
+      float sphFar(vec3 o, vec3 d, float r){ float b = dot(o, d); float D = b * b - (dot(o, o) - r * r); return D < 0.0 ? -1.0 : -b + sqrt(D); }
+      bool below(vec3 o, vec3 d){ float b = dot(o, d); float D = b * b - (dot(o, o) - RE * RE); return D > 0.0 && -b - sqrt(D) > 0.0; }
+      vec3 dens(vec3 p){ float h = length(p) - RE; return vec3(exp(-h / 8000.0), exp(-h / 1200.0), max(0.0, 1.0 - abs(h - 25000.0) / 15000.0)); }
+      vec3 lightDepth(vec3 p, vec3 l){
+        float ds = sphFar(p, l, RA) / 6.0;
+        vec3 od = vec3(0.0);
+        for (int j = 0; j < 6; j++) od += dens(p + l * (ds * (float(j) + 0.5)));
+        return od * ds;
+      }
+      vec3 ext(vec3 od){ return BR * od.x + vec3(uBM * 1.11 * od.y) + BO * od.z; }
+      float phaseR(float mu){ return 0.0596831 * (1.0 + mu * mu); }
+      float phaseM(float mu){ const float g = 0.76; float g2 = g * g; return 0.1193662 * (1.0 - g2) * (1.0 + mu * mu) / ((2.0 + g2) * pow(1.0 + g2 - 2.0 * g * mu, 1.5)); }
+      void main(){
+        float az = (vUv.x - 0.5) * 6.2831853;
+        float el = vUv.y * vUv.y * 1.5707963;
+        vec3 d = vec3(cos(el) * cos(az), sin(el), cos(el) * sin(az));
+        vec3 ro = vec3(0.0, RE + ${ATM.VIEW_H.toFixed(1)}, 0.0);
+        float tMax = sphFar(ro, d, RA);
+        vec3 od = vec3(0.0), sR = vec3(0.0), sM = vec3(0.0), mR = vec3(0.0), mM = vec3(0.0), ms = vec3(0.0);
+        float tp = 0.0;
+        float mu = dot(d, uSun), mm = dot(d, uMoon);
+        /* light scattered more than once arrives from the whole lit sky:
+           reddened like the sun on the side facing it, plain elsewhere */
+        float fms = (0.5 + 0.5 * mu) * (0.5 + 0.5 * mu);
+        for (int i = 0; i < 16; i++){
+          float f = (float(i) + 1.0) / 16.0;
+          float t1 = tMax * f * f, ds = t1 - tp, tm = 0.5 * (tp + t1);
+          tp = t1;
+          vec3 p = ro + d * tm;
+          vec3 dn = dens(p) * ds;
+          vec3 odm = od + 0.5 * dn;
+          if (uSunE > 0.0 && !below(p, uSun)){
+            vec3 a = exp(-ext(odm + lightDepth(p, uSun)));
+            sR += a * dn.x; sM += a * dn.y;
+          }
+          if (uKms > 0.0 && !below(p, uLift)){
+            vec3 ol = lightDepth(p, uLift);
+            vec3 tl = exp(-ext(vec3(0.5 * ol.xy, ol.z)));
+            ms += exp(-ext(odm)) * mix(vec3(tl.g), tl, fms) * (BR * dn.x + vec3(uBM * dn.y));
+          }
+          if (uMoonE > 0.0 && !below(p, uMoon)){
+            vec3 a = exp(-ext(odm + lightDepth(p, uMoon)));
+            mR += a * dn.x; mM += a * dn.y;
+          }
+          od += dn;
+        }
+        vec3 L = uSunE * (sR * BR * phaseR(mu) + sM * uBM * phaseM(mu) + uKms * ms * 0.0795775 * (0.7 + 0.3 * mu))
+               + uMoonE * uMoonTint * (mR * BR * phaseR(mm) + mM * uBM * phaseM(mm));
+        gl_FragColor = vec4(sqrt(max(L * uEnc, 0.0)), 1.0);
+      }`,
+    depthTest: false, depthWrite: false,
+  }),
+};
+{
+  const q = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), SKYLUT.mat);
+  q.frustumCulled = false;
+  SKYLUT.scene.add(q);
+}
+/* a float target where the device can draw into one; otherwise
+   8-bit, which the square-root encoding and a per-update scale
+   keep free of visible banding */
+function skyLutTarget(){
+  if (ATM.lut) return ATM.lut;
+  const ext = renderer.extensions;
+  ATM.lutFloat = !!(ext.has('EXT_color_buffer_float') || ext.has('EXT_color_buffer_half_float'));
+  const rt = new THREE.WebGLRenderTarget(SKYLUT.W, SKYLUT.H, {
+    type: ATM.lutFloat ? THREE.HalfFloatType : THREE.UnsignedByteType,
+    depthBuffer: false, magFilter: THREE.LinearFilter, minFilter: THREE.LinearFilter,
+    wrapS: THREE.RepeatWrapping, wrapT: THREE.ClampToEdgeWrapping, generateMipmaps: false,
+  });
+  ATM.lut = rt;
+  ATMU.tSkyLut.value = rt.texture;
+  return rt;
+}
+cv.addEventListener('webglcontextrestored', () => { ATM.lutDirty = true; ATM.key = null; });
+
+/* the state the sky depends on; the sky is redrawn when it moves */
+const ATMS = { sun: [0, 1, 0], lift: [0, 1, 0], moon: [0, 1, 0], sunE: 1, moonE: 0, kms: ATM.KMS, bm: ATM.BM };
+const _sd = [0, 0, 0], _sr = [0, 0, 0];
+/* what the dome shader shows toward d, before clouds and weather */
+function atmClearJS(d, out){
+  atmScatter(d, ATMS, _sr);
+  const el = Math.max(Math.asin(clamp(d[1], -1, 1)), 0.03), k = smoothstep(0, 0.35, el);
+  const r = _sr[0] * ATM.GAIN * lerp(0.98, 1, k), g = _sr[1] * ATM.GAIN * lerp(0.92, 1, k), b = _sr[2] * ATM.GAIN * lerp(1.03, 1, k);
+  const l = lum3(r, g, b), s = lerp(1, ATM.SAT, k);
+  return out.setRGB(Math.max(0, l + (r - l) * s), Math.max(0, l + (g - l) * s), Math.max(0, l + (b - l) * s));
+}
+/* … and with an overcast drawn over it, as atmSky() does */
+function atmOvercastJS(c, dy){
+  const oc = ATMU.uOvercast.value, oe = 0.62 + 0.38 * Math.max(dy, 0);
+  return c.lerp(_c3.copy(ATMU.uOvercastCol.value).multiplyScalar(oe), oc);
+}
+const ATM_RING = [[Math.PI / 2, 1], [0.52, 4], [0.14, 4]];
+
+/* Least-squares fit of the horizon ring (colour against the cosine
+   of the angle to the sun) to 1, c, c², c⁸, c³² — broad sky plus the
+   glow around a low sun, within a few per cent of the panorama. */
+const ATM_FIT = { n: 24, basis: c => { const p = Math.max(c, 0), p8 = Math.pow(p, 8); return [1, c, c * c, p8, p8 * p8 * p8 * p8]; } };
+function atmFitHorizon(el, az){
+  const K = 5, A = Array.from({ length: K }, () => new Float64Array(K)), B = [0, 1, 2].map(() => new Float64Array(K));
+  const e = ATMU.uFog.value.w, ce = Math.cos(e), se = Math.sin(e);
+  for (let i = 0; i <= ATM_FIT.n; i++){
+    const dA = i / ATM_FIT.n * Math.PI, c = Math.cos(dA), f = ATM_FIT.basis(c);
+    _sd[0] = ce * Math.cos(az + dA); _sd[1] = se; _sd[2] = ce * Math.sin(az + dA);
+    const col = atmOvercastJS(atmClearJS(_sd, _c2), se);
+    const v = [col.r, col.g, col.b];
+    for (let r = 0; r < K; r++){
+      for (let k = 0; k < K; k++) A[r][k] += f[r] * f[k];
+      for (let ch = 0; ch < 3; ch++) B[ch][r] += f[r] * v[ch];
+    }
+  }
+  for (let r = 0; r < K; r++) A[r][r] += 1e-9;
+  const X = [0, 1, 2].map(ch => solveLinear(A, B[ch]));
+  for (let k = 0; k < K; k++) ATMU.uFogK.value[k].set(X[0][k], X[1][k], X[2][k]);
+  ATMU.uSunH.value.set(Math.cos(az), Math.sin(az));
+}
+function solveLinear(A0, b0){
+  const n = b0.length, A = A0.map(r => Array.from(r)), b = Array.from(b0);
+  for (let i = 0; i < n; i++){
+    let p = i;
+    for (let r = i + 1; r < n; r++) if (Math.abs(A[r][i]) > Math.abs(A[p][i])) p = r;
+    [A[i], A[p]] = [A[p], A[i]]; [b[i], b[p]] = [b[p], b[i]];
+    for (let r = i + 1; r < n; r++){
+      const f = A[r][i] / A[i][i];
+      for (let c = i; c < n; c++) A[r][c] -= f * A[i][c];
+      b[r] -= f * b[i];
+    }
+  }
+  const x = new Array(n).fill(0);
+  for (let i = n - 1; i >= 0; i--){
+    let s = b[i];
+    for (let c = i + 1; c < n; c++) s -= A[i][c] * x[c];
+    x[i] = s / A[i][i];
+  }
+  return x;
+}
+function refreshSky(el, az, haze, moonE, overcast){
+  const key = [el, az, haze, moonE, overcast];
+  const old = ATM.key;
+  if (old && !ATM.lutDirty && Math.abs(old[0] - key[0]) < 0.002 && Math.abs(old[1] - key[1]) < 0.004
+      && Math.abs(old[2] - key[2]) < 0.01 && Math.abs(old[3] - key[3]) < ATM.MOON_E * 0.02 && Math.abs(old[4] - key[4]) < 0.01) return;
+  ATM.key = key;
+  const rt = skyLutTarget();
+  const ce = Math.cos(el), el2 = el + ATM.LIFT, ce2 = Math.cos(el2);
+  ATMS.sun[0] = ce * Math.cos(az); ATMS.sun[1] = Math.sin(el); ATMS.sun[2] = ce * Math.sin(az);
+  ATMS.lift[0] = ce2 * Math.cos(az); ATMS.lift[1] = Math.sin(el2); ATMS.lift[2] = ce2 * Math.sin(az);
+  ATMS.moon[0] = ENVSTATE.moonSky.x; ATMS.moon[1] = ENVSTATE.moonSky.y; ATMS.moon[2] = ENVSTATE.moonSky.z;
+  ATMS.sunE = el > -0.35 ? 1 : 0;
+  ATMS.kms = el2 > -0.3 ? ATM.KMS : 0;
+  ATMS.moonE = moonE;
+  ATMS.bm = ATM.BM * haze;
+
+  /* colours for the lights and the clouds */
+  atmTransmittance(ATMS.sun, ATMS.bm, ATM.VIEW_H, ATM.T);
+  atmTransmittance(ATMS.sun, ATMS.bm, ATM.CLOUD_H, ATM.Tc);
+  ATM.TL = lum3(ATM.T[0], ATM.T[1], ATM.T[2]);
+  const ring = [];
+  let peak = 1e-4;
+  for (const [e, n] of ATM_RING){
+    for (let i = 0; i < n; i++){
+      const a = az + (i / n) * Math.PI * 2;
+      _sd[0] = Math.cos(e) * Math.cos(a); _sd[1] = Math.sin(e); _sd[2] = Math.cos(e) * Math.sin(a);
+      const c = atmClearJS(_sd, new THREE.Color());
+      ring.push([c, _sd[1]]);
+      peak = Math.max(peak, c.r, c.g, c.b);
+    }
+  }
+  /* an overcast is as bright as the clear sky it hides */
+  const clear = _c1.setRGB(0, 0, 0);
+  for (const [c] of ring) clear.add(c);
+  clear.multiplyScalar(1 / ring.length);
+  ATMU.uOvercast.value = overcast;
+  ATMU.uOvercastCol.value.copy(ENV.overcast).multiplyScalar(Math.max(lum3(clear.r, clear.g, clear.b) * 1.25, 0.004));
+  const avg = ATM.skyAvg.setRGB(0, 0, 0);
+  for (const [c, dy] of ring) avg.add(atmOvercastJS(c, dy));
+  avg.multiplyScalar(1 / ring.length);
+  ATM.zenith.copy(ring[0][0]);
+  _sd[0] = Math.cos(az + Math.PI / 2); _sd[1] = 0.03; _sd[2] = Math.sin(az + Math.PI / 2);
+  atmOvercastJS(atmClearJS(_sd, ATM.horizon), 0.03);
+  atmFitHorizon(el, az);
+  /* the brightest sky, toward a low sun, sets the 8-bit range */
+  const e3 = Math.max(el, 0.03);
+  _sd[0] = Math.cos(az) * Math.cos(e3); _sd[1] = Math.sin(e3); _sd[2] = Math.sin(az) * Math.cos(e3);
+  const toSun = atmClearJS(_sd, _c2);
+  peak = Math.max(peak, toSun.r, toSun.g, toSun.b) / ATM.GAIN;
+  ATM.enc = ATM.lutFloat ? 1 : 1 / (peak * 1.6);
+
+  /* redraw the panorama */
+  const u = SKYLUT.mat.uniforms;
+  u.uSun.value.fromArray(ATMS.sun); u.uLift.value.fromArray(ATMS.lift);
+  u.uSunE.value = ATMS.sunE; u.uMoonE.value = ATMS.moonE; u.uKms.value = ATMS.kms;
+  u.uBM.value = ATMS.bm; u.uEnc.value = ATM.enc;
+  ATMU.uLutScale.value = ATM.GAIN / ATM.enc;
+  const prev = renderer.getRenderTarget();
+  renderer.setRenderTarget(rt);
+  renderer.render(SKYLUT.scene, SKYLUT.cam);
+  renderer.setRenderTarget(prev);
+  ATM.lutDirty = false;
+}
+
+/* ---- the dome, in two passes ----
+   The background pass paints the sky itself, first, over the whole
+   upper half of the view (the ground covers the rest).  Sun, moon,
+   stars and clouds come after the city, depth-tested, so they cost
+   nothing where buildings stand in front of them. */
+const SKY_VS = `
+  varying vec3 vDir;
+  void main(){
+    vDir = position;
+    vec4 p = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    gl_Position = p.xyww;
+  }`;
+const skyMat = new THREE.ShaderMaterial({
+  uniforms: { ...ATMU },
+  vertexShader: SKY_VS,
+  fragmentShader: `
+    ${GLSL_ATM}
+    varying vec3 vDir;
+    void main(){
+      gl_FragColor = vec4(atmSky(normalize(vDir)), 1.0);
       #include <tonemapping_fragment>
       #include <colorspace_fragment>
     }`,
   side: THREE.BackSide, depthWrite: false, depthTest: false, fog: false,
 });
-const sky = new THREE.Mesh(new THREE.SphereGeometry(1, 32, 16), skyMat);
+const skyFxMat = new THREE.ShaderMaterial({
+  uniforms: {
+    ...ATMU,
+    uSunDir: { value: new THREE.Vector3(0, 1, 0) }, uMoonDir: { value: ENVSTATE.moonSky },
+    uSunDisc: { value: new THREE.Color() }, uMoonDisc: { value: new THREE.Color() },
+    uCloudSun: { value: new THREE.Color() }, uCloudAmb: { value: new THREE.Color() },
+    uStars: { value: 0 }, uTime: { value: 0 },
+  },
+  vertexShader: SKY_VS,
+  fragmentShader: `
+    ${GLSL_ATM}
+    uniform vec3 uSunDir, uMoonDir, uSunDisc, uMoonDisc, uCloudSun, uCloudAmb;
+    uniform float uStars, uTime;
+    varying vec3 vDir;
+    float hash13(vec3 p){ p = fract(p * 0.1031); p += dot(p, p.zyx + 31.32); return fract((p.x + p.y) * p.z); }
+    /* coordinates on a disc of angular radius r around direction c */
+    vec2 discUV(vec3 d, vec3 c, float r){
+      vec3 x = normalize(cross(c, vec3(0.0, 1.0, 0.0)));
+      vec3 y = cross(x, c);
+      return dot(d, c) > 0.0 ? vec2(dot(d, x), dot(d, y)) / r : vec2(9.0);
+    }
+    vec3 toOutput(vec3 c){
+      #ifdef TONE_MAPPING
+        c = toneMapping(c);
+      #endif
+      return linearToOutputTexel(vec4(c, 1.0)).rgb;
+    }
+    void main(){
+      vec3 d = normalize(vDir);
+      if (d.y < 0.0) discard;
+      /* clouds: a thin layer overhead, lit from the side facing the sun */
+      float t = (uCloudH - cameraPosition.y) / max(d.y, 0.01);
+      vec2 p = cameraPosition.xz + d.xz * t;
+      float den = atmCloudDensity(p);
+      vec2 ts = uSunDir.xz / max(length(uSunDir.xz), 1e-3);
+      float dl = atmCloudDensity(p + ts * 380.0);
+      float ca = den * smoothstep(0.01, 0.11, d.y) * step(cameraPosition.y, uCloudH) * 0.94;
+      float lit = exp(-dl * 1.9) * 0.8 + 0.2;
+      float silver = pow(max(dot(d, uSunDir), 0.0), 9.0) * (1.0 - den) * 2.5;
+      vec3 cc = uCloudAmb * (1.0 - 0.32 * den) + uCloudSun * (lit + silver);
+      float haze = 1.0 - exp(-t * 2.2e-5);            // far clouds sink into the sky behind
+      /* sun and moon */
+      vec3 add = vec3(0.0);
+      vec2 su = discUV(d, uSunDir, 0.0105);
+      float sr = length(su);
+      add += uSunDisc * (1.0 - smoothstep(0.82, 1.0, sr)) * (0.55 + 0.45 * sqrt(max(1.0 - sr * sr, 0.0)));
+      vec2 mu = discUV(d, uMoonDir, 0.017);
+      float mr = length(mu);
+      float maria = 0.82 + 0.18 * smoothstep(-0.3, 0.6, sin(mu.x * 3.1 + 0.4) * sin(mu.y * 2.7 - 1.1) + 0.45 * sin(mu.x * 7.3 - mu.y * 5.1));
+      add += uMoonDisc * ((1.0 - smoothstep(0.86, 1.0, mr)) * maria + 0.035 * exp(-mr * 0.09));
+      /* stars, lost in haze near the horizon */
+      if (uStars > 0.0){
+        vec3 q = d * 230.0, c = floor(q);
+        float h = hash13(c);
+        vec3 sp = normalize(c + 0.2 + 0.6 * vec3(hash13(c + 11.1), hash13(c + 23.7), hash13(c + 37.3)));
+        float px = max(length(fwidth(d)), 1e-5);
+        float a = length(cross(d, sp)) / px;
+        float mag = pow(hash13(c + 5.3), 8.0) * 5.0 + 0.3;
+        vec3 tint = mix(vec3(1.0, 0.8, 0.62), vec3(0.72, 0.84, 1.0), hash13(c + 7.7));
+        float tw = 0.7 + 0.3 * sin(uTime * (1.3 + 3.0 * h) + h * 40.0);
+        add += tint * step(0.982, h) * exp(-a * a * 0.9) * mag * tw * uStars * smoothstep(0.005, 0.1, d.y) * 0.6;
+      }
+      add *= smoothstep(0.0, 0.004, d.y);
+      /* over the background: clouds by their cover, the rest added */
+      float alpha = ca * (1.0 - haze);
+      gl_FragColor = vec4(toOutput(cc) * alpha + toOutput(add) * (1.0 - ca), alpha);
+    }`,
+  side: THREE.BackSide, depthWrite: false, depthTest: true, transparent: true, fog: false,
+  blending: THREE.CustomBlending, blendEquation: THREE.AddEquation,
+  blendSrc: THREE.OneFactor, blendDst: THREE.OneMinusSrcAlphaFactor,
+});
+/* the background reaches a little below the horizon, the details stop at it */
+const sky = new THREE.Mesh(new THREE.SphereGeometry(1, 48, 14, 0, Math.PI * 2, 0, Math.PI / 2 + 0.04), skyMat);
 sky.renderOrder = -1000;
 sky.frustumCulled = false;
-scene.add(sky);
+const skyFx = new THREE.Mesh(new THREE.SphereGeometry(1, 48, 12, 0, Math.PI * 2, 0, Math.PI / 2), skyFxMat);
+skyFx.renderOrder = -900;
+skyFx.frustumCulled = false;
+scene.add(sky, skyFx);
 
 const ground = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), MAT.ground);
 ground.rotation.x = -Math.PI / 2;
 ground.position.y = GROUND_Y;
 ground.receiveShadow = true;
-ground.renderOrder = -500;
+ground.renderOrder = 50;
 scene.add(ground);
 
 /* A world-space grid drawn in the fragment shader: lines stay one
@@ -5089,82 +5846,209 @@ snapGrid.userData.sharedGeo = true;
 snapGrid.visible = false;
 scene.add(snapGrid);
 
-function updateEnvironment(){
-  const dark = nightF() / NIGHT_MAX;              // 0 day … 1 night
+/* ------------------------------------------------------------
+   Sky reflections
+
+   From Medium up, glossy surfaces — glass, car bodies, wet asphalt,
+   metal — mirror the sky.  A small cube map of the dome, its clouds
+   and a stand-in for the ground is captured around the view and
+   prefiltered by roughness, and recaptured only when the sky has
+   changed.  Diffuse sky light still comes from the hemisphere
+   light, which costs far less than a lookup on every surface.
+   ------------------------------------------------------------ */
+const ENVCAP = {
+  SIZE: 64, MIN_GAP: 0.35,
+  scene: new THREE.Scene(), cube: null, cam: null, pmrem: null, out: null,
+  lutSeen: null, cloud: new THREE.Vector3(), at: new THREE.Vector2(1e9, 1e9), glow: -1, last: -1e9, n: 0,
+  groundAlbedo: C3('#262a22'),
+};
+{
+  const dome = new THREE.Mesh(new THREE.SphereGeometry(1, 32, 16), skyMat);
+  const fx = new THREE.Mesh(new THREE.SphereGeometry(1, 32, 8, 0, Math.PI * 2, 0, Math.PI / 2), skyFxMat);
+  const ground = new THREE.Mesh(new THREE.CircleGeometry(1, 48),
+    atmospherePatch(new THREE.MeshBasicMaterial({ color: 0x000000, toneMapped: false }), 'basic'));
+  ground.rotation.x = -Math.PI / 2;
+  ground.scale.setScalar(60000);
+  dome.scale.setScalar(70000); fx.scale.setScalar(70000);
+  dome.renderOrder = -1000; fx.renderOrder = -900;
+  for (const m of [dome, fx, ground]) m.frustumCulled = false;
+  ENVCAP.dome = dome; ENVCAP.fx = fx; ENVCAP.ground = ground;
+  ENVCAP.scene.add(dome, fx, ground);
+}
+
+/* only surfaces glossy enough to show a reflection look it up */
+const ENV_MATS = () => [MAT.facade, MAT.vehicle, MAT.road, MAT.metal, MAT.sign, MAT.dark, MAT.lampHead];
+function setEnvMaps(tex){
+  for (const m of ENV_MATS()) if (m.envMap !== tex){ m.envMap = tex; m.needsUpdate = true; }
+}
+function envCapture(force){
+  if (!(Q.ibl && postSupported())){
+    setEnvMaps(null);
+    return;
+  }
+  if (!ENVCAP.cube){
+    ENVCAP.cube = new THREE.WebGLCubeRenderTarget(ENVCAP.SIZE, { type: THREE.HalfFloatType, generateMipmaps: false });
+    ENVCAP.cam = new THREE.CubeCamera(1, 80000, ENVCAP.cube);
+    ENVCAP.pmrem = new THREE.PMREMGenerator(renderer);
+    force = true;
+  }
+  /* what the sky looks like now, against what was captured: a new
+     panorama, clouds drifted, the view moved on, city lights */
+  const cu = ATMU.uCloud.value;
+  const dx = (cu.x - ENVCAP.cloud.x + 1.5) % 1 - 0.5, dy = (cu.y - ENVCAP.cloud.y + 1.5) % 1 - 0.5;
+  const changed = ENVCAP.lutSeen !== ATM.key
+    || Math.hypot(dx, dy) * ATM.CLOUD_TILE > 120 || Math.abs(cu.z - ENVCAP.cloud.z) > 0.02
+    || Math.hypot(CAM.x - ENVCAP.at.x, CAM.y - ENVCAP.at.y) > 250
+    || Math.abs(ATMU.uCityGlow.value.r - ENVCAP.glow) > 0.001;
+  const now = performance.now() / 1000;
+  if (ENVCAP.out && MAT.facade.envMap !== ENVCAP.out.texture) force = true;
+  if (!force && (!changed || now - ENVCAP.last < ENVCAP.MIN_GAP)) return;
+  ENVCAP.last = now; ENVCAP.n++;
+  ENVCAP.lutSeen = ATM.key;
+  ENVCAP.cloud.copy(cu);
+  ENVCAP.at.set(CAM.x, CAM.y);
+  ENVCAP.glow = ATMU.uCityGlow.value.r;
+
+  /* the ground as it would look from above: lit by sun and sky */
+  const g = ENVCAP.ground.material.color;
+  g.copy(sun.color).multiplyScalar(sun.intensity * Math.max(ENVSTATE.dir.y, 0))
+   .add(_c1.copy(ATM.skyAvg).multiplyScalar(Math.PI))
+   .multiply(ENVCAP.groundAlbedo).multiplyScalar(1 / Math.PI)
+   .add(_c1.copy(ATMU.uCityGlow.value).multiplyScalar(0.6));
+
+  /* the sun is a light of its own; its disc in the map would shine twice */
+  const su = skyFxMat.uniforms;
+  const disc = _c2.copy(su.uSunDisc.value), stars = su.uStars.value;
+  su.uSunDisc.value.setRGB(0, 0, 0); su.uStars.value = 0;
+  ENVCAP.cam.position.set(CAM.x, 25, CAM.y);
+  ENVCAP.dome.position.copy(ENVCAP.cam.position); ENVCAP.fx.position.copy(ENVCAP.cam.position);
+  ENVCAP.ground.position.set(CAM.x, 0, CAM.y);
+  ENVCAP.cam.update(renderer, ENVCAP.scene);
+  su.uSunDisc.value.copy(disc); su.uStars.value = stars;
+  ENVCAP.out = ENVCAP.pmrem.fromCubemap(ENVCAP.cube.texture, ENVCAP.out);
+  setEnvMaps(ENVCAP.out.texture);
+}
+function dropEnvCapture(){
+  setEnvMaps(null);
+  if (ENVCAP.out){ ENVCAP.out.dispose(); ENVCAP.out = null; }
+  if (ENVCAP.cube){ ENVCAP.cube.dispose(); ENVCAP.cube = null; }
+  if (ENVCAP.pmrem){ ENVCAP.pmrem.dispose(); ENVCAP.pmrem = null; }
+}
+cv.addEventListener('webglcontextrestored', () => { ENVCAP.out = ENVCAP.cube = ENVCAP.pmrem = null; setEnvMaps(null); ENVCAP.lutSeen = null; });
+QUALITY_HOOKS.push(q => { if (!q.ibl) dropEnvCapture(); else ENVCAP.lutSeen = null; });
+
+function updateEnvironment(dtReal){
   const rain = CFG.rain / 100;
-  ENVSTATE.dark = dark; ENVSTATE.rain = rain;
 
   /* the sun rises in the east (+x) at about 05:50, stands in the
      south (+z, since y points south) around 12:40, sets at 19:25 */
   const h = CFG.timeOfDay / 60;
   const k = (h - 5.83) / (19.42 - 5.83);
-  const el = Math.sin(clamp(k, -0.25, 1.25) * Math.PI) * 1.0;
+  const el = Math.sin(clamp(k, -0.25, 1.25) * Math.PI);
+
+  /* darkness keeps the 2D clock but never falls behind the sky: that
+     clock's dusk runs twenty minutes after this sunset, and lamps and
+     windows would come on only once the sky had already gone dark.
+     Like street lights, they are half on as the sun sets */
+  const clockDark = nightF() / NIGHT_MAX;         // 0 day … 1 night
+  const dark = Math.max(clockDark, smoothstep(0.12, -0.14, el));
+  ENVSTATE.dark = dark; ENVSTATE.rain = rain;
   const az = clamp(k, 0, 1) * Math.PI;
   const sunUp = smoothstep(-0.05, 0.1, el);
-  ENVSTATE.sunUp = sunUp;
-  const e = Math.max(el, 0.02);
-  skyMat.uniforms.uSunDir.value.set(Math.cos(az) * Math.cos(e), Math.sin(e), Math.sin(az) * Math.cos(e));
+  ENVSTATE.sunUp = sunUp; ENVSTATE.sunEl = el;
+  ATM.sun.set(Math.cos(az) * Math.cos(el), Math.sin(el), Math.sin(az) * Math.cos(el));
   /* shadows are cast from no lower than ~35°: a true dawn sun throws
      shadows across whole blocks and the map stops reading */
   const es = Math.max(el, 0.62);
   const sunDir = _v3.set(Math.cos(az) * Math.cos(es), Math.sin(es), Math.sin(az) * Math.cos(es));
   ENVSTATE.dir.copy(sunDir).lerp(ENVSTATE.moonDir, 1 - sunUp).normalize();
+  ATMU.uShadowDir.value.copy(ENVSTATE.dir);
 
-  /* key light: warm sun, orange when low, pale moon at night */
-  const lowSun = smoothstep(0.04, 0.5, el);
-  _c1.copy(ENV.sunLo).lerp(ENV.sunHi, lowSun);
+  /* weather and the city's own light */
+  const lit = smoothstep(0.15, 0.7, dark);
+  ATMU.uCityGlow.value.copy(ENV.cityGlow).multiplyScalar(0.016 * lit * (1 + 1.6 * rain));
+  refreshSky(el, az, 0.6 + rain * 1.6, ATM.MOON_E * smoothstep(0.3, 1, dark), rain * 0.88);
+  const avgL = lum3(ATM.skyAvg.r, ATM.skyAvg.g, ATM.skyAvg.b);
+
+  /* key light: the sun as the air leaves it, a pale moon at night */
+  const T = ATM.T, tm = Math.max(T[0], T[1], T[2], 1e-6);
+  _c1.setRGB(T[0] / tm, T[1] / tm, T[2] / tm);
   sun.color.copy(ENV.moon).lerp(_c1, sunUp);
-  sun.intensity = lerp(0.35, 2.9 * (0.5 + 0.5 * lowSun), sunUp) * (1 - rain * 0.55);
+  const sunI = ATM.SUN_I * Math.sqrt(ATM.TL / 0.82) * smoothstep(-0.01, 0.06, el);
+  /* the sun fades at the horizon before the moon takes over; the
+     key light never drops below the moon's, or sunset would be the
+     darkest moment of the day */
+  sun.intensity = Math.max(lerp(0.35, sunI, sunUp), 0.35) * (1 - rain * 0.55);
 
-  hemi.color.copy(ENV.hemiSkyD).lerp(ENV.hemiSkyN, dark);
-  hemi.groundColor.copy(ENV.hemiGndD).lerp(ENV.hemiGndN, dark);
-  hemi.intensity = lerp(1.6, 0.8, dark) + rain * 0.3;
+  /* sky light: the dome's average, a little less blue than it looks,
+     with a floor so night never goes black */
+  const A = ATM.skyAvg;
+  _c2.setRGB(A.r, A.g, A.b).lerp(_c3.setScalar(avgL), 0.55).multiplyScalar(Math.PI * 0.8);
+  _c3.copy(ENV.hemiSkyN).multiplyScalar(1.2);
+  const sunH = sun.intensity * Math.max(ATM.sun.y, 0) * sunUp;
+  hemi.color.setRGB(Math.max(_c2.r, _c3.r), Math.max(_c2.g, _c3.g), Math.max(_c2.b, _c3.b));
+  hemi.groundColor.copy(ENV.groundAlbedo).multiplyScalar((sunH + _c2.g) * 0.8);
+  _c3.copy(ENV.hemiGndN).multiplyScalar(0.8);
+  hemi.groundColor.setRGB(Math.max(hemi.groundColor.r, _c3.r), Math.max(hemi.groundColor.g, _c3.g), Math.max(hemi.groundColor.b, _c3.b));
+  hemi.intensity = 1;
 
-  /* sky and fog share the horizon colour, so the ground melts into it */
-  const dusk = clamp(1 - Math.abs(el - 0.02) / 0.3, 0, 1) * (1 - rain);
-  _c1.copy(ENV.horD).lerp(ENV.horN, dark).lerp(ENV.horDusk, dusk * 0.55);
-  _c2.copy(ENV.zenD).lerp(ENV.zenN, dark);
-  if (rain > 0){
-    _c3.copy(ENV.rainD).lerp(ENV.rainN, dark);
-    _c1.lerp(_c3, rain * 0.75); _c2.lerp(_c3, rain * 0.6);
-  }
-  skyMat.uniforms.uHor.value.copy(_c1);
-  skyMat.uniforms.uTop.value.copy(_c2);
-  skyMat.uniforms.uBot.value.copy(_c1).multiplyScalar(0.8);
-  skyMat.uniforms.uSunCol.value.copy(sun.color).multiplyScalar(sunUp * (1 - rain * 0.8));
-  skyMat.uniforms.uStars.value = smoothstep(0.6, 1, dark) * (1 - rain);
-  scene.fog.color.copy(_c1);
+  /* sun and moon discs, stars, clouds */
+  const su = skyFxMat.uniforms;
+  su.uSunDir.value.copy(ATM.sun);
+  su.uSunDisc.value.setRGB(T[0], T[1], T[2]).multiplyScalar(40 * (1 - rain));
+  su.uMoonDisc.value.copy(ENV.moonDisc).multiplyScalar((0.08 + 0.9 * smoothstep(0.2, 0.8, clockDark)) * (1 - rain * 0.9));
+  su.uStars.value = smoothstep(0.55, 1, clockDark) * (1 - rain);
+  su.uTime.value = (performance.now() / 1000) % 1000;
+  const Tc = ATM.Tc, tcm = Math.max(Tc[0], Tc[1], Tc[2], 1e-6);
+  const cl = 2.1 * Math.sqrt(lum3(Tc[0], Tc[1], Tc[2]) / 0.85) * (1 - rain * 0.8);
+  su.uCloudSun.value.setRGB(Tc[0] / tcm * cl, Tc[1] / tcm * cl, Tc[2] / tcm * cl);
+  su.uCloudAmb.value.copy(ATM.zenith).multiplyScalar(1.3).add(_c1.copy(ATM.skyAvg).multiplyScalar(0.45))
+    .add(_c3.copy(ENV.moon).multiplyScalar(0.03 * dark)).add(_c2.copy(ATMU.uCityGlow.value).multiplyScalar(1.6));
+  if (rain > 0) su.uCloudAmb.value.lerp(_c3.copy(ATMU.uOvercastCol.value).multiplyScalar(0.8), rain);
+
+  /* the clouds drift with the simulation clock */
+  const dts = (dtReal || 0) * (SIM.running ? SIM.speed : 0);
+  const cu = ATMU.uCloud.value;
+  cu.x = (cu.x + ATM.WIND[0] * dts / ATM.CLOUD_TILE) % 1;
+  cu.y = (cu.y + ATM.WIND[1] * dts / ATM.CLOUD_TILE) % 1;
+  cu.z = 0.36 + 0.6 * rain;
+  cu.w = Q.cloudShadows ? 0.55 * sunUp * (1 - rain * 0.85) : 0;
+
+  /* fog thickens in the rain; looking straight down on the plan it
+     thins, since a whisper of haze over dark ground reads as a veil */
+  const planView = smoothstep(1.1, 1.5, CAM.pitch);
+  ATMU.uFog.value.set(0.00012 * (1 + 2 * rain) * (1 - 0.65 * planView), 1 / (150 * (1 + 0.5 * rain)), camera.far * 0.97, 0.03);
+  renderer.setClearColor(ATM.horizon, 1);
   scene.background = null;
-  renderer.setClearColor(_c1, 1);
-  const fogK = 1 - rain * 0.45;
-  scene.fog.near = (CAM.dist * 1.4 + 300) * fogK;
-  scene.fog.far = (CAM.dist * 5 + 2600) * fogK;
   renderer.toneMappingExposure = lerp(1.05, 1.4, dark);
 
   /* wet pavement is darker and shinier */
   MAT.road.color.copy(ROAD_DRY).lerp(ROAD_WET, rain);
-  MAT.road.roughness = lerp(0.92, 0.34, rain);
+  WET.uWet.value = rain;
   MAT.walk.color.copy(WALK_DRY).lerp(WALK_WET, rain);
   MAT.walk.roughness = lerp(0.94, 0.55, rain);
 
   /* lights of the city */
-  const lit = smoothstep(0.15, 0.7, dark);
   MAT.facade.emissiveIntensity = lit * 1.35;
   MAT.lampHead.emissiveIntensity = lit * 2.4;
   if (CITY3D.poolMat) CITY3D.poolMat.opacity = lit * 0.5;
 
-  document.getElementById('vignette').style.opacity = (dark * 0.75).toFixed(3);
+  /* the float pipeline draws its own vignette, under the overlays */
+  document.getElementById('vignette').style.opacity = Q.post && postSupported() ? '0' : (dark * 0.75).toFixed(3);
 
   /* keep the dome and the ground centred on the view */
   sky.position.copy(camera.position);
   sky.scale.setScalar(camera.far * 0.9);
-  const gs = Math.max(20000, CAM.dist * 30);
+  skyFx.position.copy(sky.position);
+  skyFx.scale.copy(sky.scale);
+  const gs = 2.2 * (camera.far + CAM.dist);
   ground.scale.set(gs, gs, 1);
   ground.position.x = CAM.x; ground.position.z = CAM.y;
   TEX_GROUND.repeat.set(gs / 48, gs / 48);
   TEX_GROUND.offset.set((CAM.x / 48) % 1, (-CAM.y / 48) % 1);
 
   fitShadow();
+  envCapture();
 }
 
 /* The shadow frustum follows the camera, sized to what is on
@@ -5174,8 +6058,9 @@ function updateEnvironment(){
 const _lx = new THREE.Vector3(), _ly = new THREE.Vector3(), _lz = new THREE.Vector3(), _lc = new THREE.Vector3();
 function fitShadow(){
   sun.castShadow = CFG.shadows;
-  if (!CFG.shadows) return;
-  const s = clamp(CAM.dist * 0.72 + 30, 60, 1500);
+  if (!CFG.shadows){ sunFar.visible = false; return; }
+  /* with a far cascade behind it, the near one can be tighter and sharper */
+  const s = CSM_OK && (Q.cascades || 1) > 1 ? clamp(CAM.dist * 0.55 + 25, 45, 1200) : clamp(CAM.dist * 0.72 + 30, 60, 1500);
   const sc = sun.shadow.camera;
   const size = sun.shadow.mapSize.x;
   const fwd = Math.cos(CAM.pitch) * CAM.dist * 0.28;
@@ -5198,6 +6083,583 @@ function fitShadow(){
   }
   sun.shadow.normalBias = texel * 0.8;
   sun.target.updateMatrixWorld();
+  fitShadowFar(dir);
+}
+
+/* the far cascade: a wider square pushed out along the view, so a
+   low view down a street has shadows out toward the horizon */
+function fitShadowFar(dir){
+  sunFar.visible = !!(CSM_OK && CFG.shadows && (Q.cascades || 1) > 1);
+  if (!sunFar.visible) return;
+  const s = clamp(CAM.dist * 2.2 + 500, 600, 3500);
+  const sc = sunFar.shadow.camera, size = sunFar.shadow.mapSize.x;
+  const fwd = Math.cos(CAM.pitch) * s * 0.6;
+  _lc.set(CAM.x - Math.sin(CAM.yaw) * fwd, 0, CAM.y - Math.cos(CAM.yaw) * fwd);
+  _lz.copy(dir);
+  _lx.set(0, 1, 0).cross(_lz).normalize();
+  _ly.copy(_lz).cross(_lx);
+  const texel = 2 * s / size;
+  const px = _lc.dot(_lx), py = _lc.dot(_ly);
+  _lc.addScaledVector(_lx, Math.round(px / texel) * texel - px);
+  _lc.addScaledVector(_ly, Math.round(py / texel) * texel - py);
+  const far = 2 * s + 800;
+  sunFar.target.position.copy(_lc);
+  sunFar.position.copy(_lc).addScaledVector(dir, far * 0.5);
+  if (sc.right !== s || sc.far !== far){
+    sc.left = -s; sc.right = s; sc.top = s; sc.bottom = -s;
+    sc.near = 1; sc.far = far;
+    sc.updateProjectionMatrix();
+  }
+  sunFar.shadow.normalBias = texel * 0.8;
+  sunFar.target.updateMatrixWorld();
+}
+
+/* ------------------------------------------------------------
+   Post-processing
+
+   The scene is drawn into a floating-point target in linear light
+   and a last pass tone-maps it to the screen; effects slot in
+   between.  Editor and data overlays are not part of the picture —
+   their colours carry meaning — so they live on their own layer and
+   are drawn afterwards, straight to the screen, depth-tested against
+   the scene's depth, which the last pass copies across.  The Low
+   preset skips all of it and draws the scene directly, as before.
+   ------------------------------------------------------------ */
+const LAYER_OVERLAY = 1;
+function toOverlay(o){ o.layers.set(LAYER_OVERLAY); return o; }
+/* layers gate lights as well as meshes: both passes need them */
+hemi.layers.enable(LAYER_OVERLAY);
+sun.layers.enable(LAYER_OVERLAY);
+sunFar.layers.enable(LAYER_OVERLAY);
+/* the shadow map is drawn once per frame, not once per pass */
+renderer.shadowMap.autoUpdate = false;
+renderer.info.autoReset = false;
+
+/* Light effects drawn as display colours — lamp pools, headlight
+   throws, signal halos, glow sprites, rain — were tuned by eye to be
+   added to the screen in display space, where their soft fringes
+   show.  Added in linear light those fringes all but vanish, so on
+   the float path they are drawn with the overlays, onto the finished
+   picture: exactly as the direct path draws them. */
+const LAYER_SCREENFX = 2;
+function toScreenFx(o){ o.layers.set(LAYER_SCREENFX); return o; }
+
+const FULLSCREEN_VS = `
+  varying vec2 vUv;
+  void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`;
+
+/* three.js's NeutralToneMapping (Khronos PBR Neutral) and sRGB
+   encoding, so the picture matches the direct path exactly */
+const GLSL_TONE = `
+  vec3 neutralTone(vec3 c){
+    const float start = 0.8 - 0.04, desat = 0.15;
+    float x = min(c.r, min(c.g, c.b));
+    float off = x < 0.08 ? x - 6.25 * x * x : 0.04;
+    c -= off;
+    float peak = max(c.r, max(c.g, c.b));
+    if (peak < start) return c;
+    float d = 1.0 - start;
+    float np = 1.0 - d * d / (peak + d - start);
+    c *= np / peak;
+    float g = 1.0 - 1.0 / (desat * (peak - np) + 1.0);
+    return mix(c, vec3(np), g);
+  }
+  vec3 toSRGB(vec3 c){
+    return mix(pow(c, vec3(0.41666)) * 1.055 - 0.055, c * 12.92, vec3(lessThanEqual(c, vec3(0.0031308))));
+  }`;
+
+const POST = {
+  rt: null, w: 0, h: 0, samples: -1, ok: null, scale: 1,
+  cam: new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1),
+  scene: new THREE.Scene(),
+};
+POST.composite = new THREE.ShaderMaterial({
+  uniforms: {
+    tColor: { value: null }, tDepth: { value: null }, uExposure: { value: 1 },
+    tBloom: { value: null }, uBloom: { value: 0 }, uBloomNorm: { value: 1 },
+    tAO: { value: null }, uAO: { value: 0 },
+    uSlope: { value: new THREE.Vector3(1, 1, 1) }, uOffset: { value: new THREE.Vector3() }, uSat: { value: 1 },
+    uContrast: { value: 1 }, uVignette: { value: 0 }, uGrain: { value: 0 }, uFrame: { value: 0 },
+    uSharpen: { value: 0 }, uSrcTexel: { value: new THREE.Vector2() },
+  },
+  vertexShader: FULLSCREEN_VS,
+  fragmentShader: `
+    uniform sampler2D tColor, tDepth, tBloom, tAO;
+    uniform float uExposure, uBloom, uBloomNorm, uAO;
+    uniform vec3 uSlope, uOffset;
+    uniform float uSat, uContrast, uVignette, uGrain, uFrame, uSharpen;
+    uniform vec2 uSrcTexel;
+    varying vec2 vUv;
+    ${GLSL_TONE}
+    float hash12(vec2 p){ vec3 q = fract(vec3(p.xyx) * 0.1031); q += dot(q, q.yzx + 33.33); return fract((q.x + q.y) * q.z); }
+    void main(){
+      vec3 c = texture2D(tColor, vUv).rgb;
+      /* drawn below screen size: sharpen back, within the local range
+         so edges do not ring (in the spirit of AMD's CAS) */
+      if (uSharpen > 0.0){
+        vec3 n = texture2D(tColor, vUv + vec2(0.0, uSrcTexel.y)).rgb, s = texture2D(tColor, vUv - vec2(0.0, uSrcTexel.y)).rgb;
+        vec3 e = texture2D(tColor, vUv + vec2(uSrcTexel.x, 0.0)).rgb, w = texture2D(tColor, vUv - vec2(uSrcTexel.x, 0.0)).rgb;
+        vec3 lo = min(c, min(min(n, s), min(e, w))), hi = max(c, max(max(n, s), max(e, w)));
+        c = clamp(c + (c - (n + s + e + w) * 0.25) * uSharpen, lo, hi);
+      }
+      if (uAO > 0.0) c *= mix(1.0, texture2D(tAO, vUv).r, uAO);
+      if (uBloom > 0.0) c = mix(c, texture2D(tBloom, vUv).rgb * uBloomNorm, uBloom);
+      c *= uExposure;
+      c = clamp(neutralTone(max(c, 0.0)), 0.0, 1.0);
+      /* grade: balance, then saturation, then contrast on the display curve */
+      c = max(c * uSlope + uOffset, 0.0);
+      float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
+      c = max(mix(vec3(l), c, uSat), 0.0);
+      vec3 s = toSRGB(clamp(c, 0.0, 1.0));
+      s = (s - 0.5) * uContrast + 0.5;
+      /* vignette, as the page's old one: clear to 42%, darkest at the corners */
+      vec2 d = (vUv - 0.5) * 1.4142136;
+      s *= 1.0 - uVignette * smoothstep(0.42, 1.0, length(d));
+      /* grain, strongest in the shadows; it also dithers away banding */
+      s += (hash12(gl_FragCoord.xy + uFrame * vec2(37.0, 17.0)) - 0.5) * uGrain * (1.0 - 0.6 * dot(s, vec3(0.3333)));
+      gl_FragColor = vec4(clamp(s, 0.0, 1.0), 1.0);
+      gl_FragDepth = texture2D(tDepth, vUv).r;
+    }`,
+  depthTest: true, depthWrite: true, depthFunc: THREE.AlwaysDepth,
+});
+POST.quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), POST.composite);
+POST.quad.frustumCulled = false;
+POST.scene.add(POST.quad);
+
+/* ------------------------------------------------------------
+   Bloom
+
+   Bright light spills into its surroundings, as it does in an eye
+   or a lens.  The picture is halved again and again, each step
+   filtered wide enough not to shimmer, then the steps are added
+   back up from the smallest, so light spreads a little around a
+   lamp and far around the sun.  It works on the scene's own
+   brightness — no threshold — at a low strength, so only what is
+   really bright shows a halo.  Stronger at night, when the eye opens
+   up to the lights, and in the rain, when the air is thick.
+   ------------------------------------------------------------ */
+const BLOOM = { levels: [], w: 0, h: 0, n: 0, scene: new THREE.Scene() };
+BLOOM.down = new THREE.ShaderMaterial({
+  uniforms: { tSrc: { value: null }, uTexel: { value: new THREE.Vector2() }, uFirst: { value: 0 } },
+  vertexShader: FULLSCREEN_VS,
+  /* thirteen taps (Jimenez 2014): five overlapping 2×2 boxes; on the
+     first step each box is weighted down by its brightness, so a
+     single blazing pixel cannot flicker the whole halo */
+  fragmentShader: `
+    uniform sampler2D tSrc;
+    uniform vec2 uTexel;
+    uniform float uFirst;
+    varying vec2 vUv;
+    vec3 tap(float x, float y){ return texture2D(tSrc, vUv + vec2(x, y) * uTexel).rgb; }
+    float kw(vec3 c){ return 1.0 / (1.0 + dot(c, vec3(0.2126, 0.7152, 0.0722))); }
+    void main(){
+      vec3 a = tap(-2.0, -2.0), b = tap(0.0, -2.0), c = tap(2.0, -2.0);
+      vec3 d = tap(-1.0, -1.0), e = tap(1.0, -1.0);
+      vec3 f = tap(-2.0, 0.0), g = tap(0.0, 0.0), h = tap(2.0, 0.0);
+      vec3 i = tap(-1.0, 1.0), j = tap(1.0, 1.0);
+      vec3 k = tap(-2.0, 2.0), l = tap(0.0, 2.0), m = tap(2.0, 2.0);
+      vec3 b0 = (d + e + i + j) * 0.25;
+      vec3 b1 = (a + b + f + g) * 0.25, b2 = (b + c + g + h) * 0.25;
+      vec3 b3 = (f + g + k + l) * 0.25, b4 = (g + h + l + m) * 0.25;
+      vec3 o;
+      if (uFirst > 0.5){
+        float w0 = kw(b0) * 0.5, w1 = kw(b1) * 0.125, w2 = kw(b2) * 0.125, w3 = kw(b3) * 0.125, w4 = kw(b4) * 0.125;
+        o = (b0 * w0 + b1 * w1 + b2 * w2 + b3 * w3 + b4 * w4) / (w0 + w1 + w2 + w3 + w4);
+      } else {
+        o = b0 * 0.5 + (b1 + b2 + b3 + b4) * 0.125;
+      }
+      gl_FragColor = vec4(o, 1.0);
+    }`,
+  depthTest: false, depthWrite: false,
+});
+/* 3×3 tent, added onto the next larger step */
+BLOOM.up = new THREE.ShaderMaterial({
+  uniforms: { tSrc: { value: null }, uTexel: { value: new THREE.Vector2() } },
+  vertexShader: FULLSCREEN_VS,
+  fragmentShader: `
+    uniform sampler2D tSrc;
+    uniform vec2 uTexel;
+    varying vec2 vUv;
+    void main(){
+      vec2 d = uTexel;
+      vec3 c = texture2D(tSrc, vUv).rgb * 4.0;
+      c += (texture2D(tSrc, vUv - vec2(d.x, 0.0)).rgb + texture2D(tSrc, vUv + vec2(d.x, 0.0)).rgb
+          + texture2D(tSrc, vUv - vec2(0.0, d.y)).rgb + texture2D(tSrc, vUv + vec2(0.0, d.y)).rgb) * 2.0;
+      c += texture2D(tSrc, vUv - d).rgb + texture2D(tSrc, vUv + d).rgb
+         + texture2D(tSrc, vUv + vec2(-d.x, d.y)).rgb + texture2D(tSrc, vUv + vec2(d.x, -d.y)).rgb;
+      gl_FragColor = vec4(c * 0.0625, 1.0);
+    }`,
+  depthTest: false, depthWrite: false, blending: THREE.AdditiveBlending,
+});
+BLOOM.quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), BLOOM.down);
+BLOOM.quad.frustumCulled = false;
+BLOOM.scene.add(BLOOM.quad);
+
+function bloomTargets(w, h, n){
+  if (BLOOM.w === w && BLOOM.h === h && BLOOM.n === n) return;
+  dropBloomTargets();
+  let lw = w, lh = h;
+  for (let i = 0; i < n; i++){
+    lw = Math.ceil(lw / 2); lh = Math.ceil(lh / 2);
+    if (Math.min(lw, lh) < 4) break;
+    BLOOM.levels.push(new THREE.WebGLRenderTarget(lw, lh, {
+      type: THREE.HalfFloatType, depthBuffer: false, generateMipmaps: false,
+      magFilter: THREE.LinearFilter, minFilter: THREE.LinearFilter,
+    }));
+  }
+  BLOOM.w = w; BLOOM.h = h; BLOOM.n = n;
+}
+function dropBloomTargets(){
+  for (const rt of BLOOM.levels) rt.dispose();
+  BLOOM.levels.length = 0;
+  BLOOM.w = BLOOM.h = BLOOM.n = 0;
+}
+/* halve down the chain, then add back up it; returns the sum */
+function renderBloom(src){
+  bloomTargets(POST.w, POST.h, Q.bloom || 0);
+  const L = BLOOM.levels;
+  if (!L.length) return null;
+  const q = BLOOM.quad, du = BLOOM.down.uniforms, uu = BLOOM.up.uniforms;
+  q.material = BLOOM.down;
+  let prev = src;
+  for (let i = 0; i < L.length; i++){
+    du.tSrc.value = prev.texture;
+    du.uTexel.value.set(1 / prev.width, 1 / prev.height);
+    du.uFirst.value = i === 0 ? 1 : 0;
+    renderer.setRenderTarget(L[i]);
+    renderer.render(BLOOM.scene, POST.cam);
+    prev = L[i];
+  }
+  q.material = BLOOM.up;
+  renderer.autoClear = false;
+  for (let i = L.length - 1; i > 0; i--){
+    uu.tSrc.value = L[i].texture;
+    uu.uTexel.value.set(1 / L[i].width, 1 / L[i].height);
+    renderer.setRenderTarget(L[i - 1]);
+    renderer.render(BLOOM.scene, POST.cam);
+  }
+  renderer.autoClear = true;
+  return L[0];
+}
+
+/* ------------------------------------------------------------
+   Ambient occlusion
+
+   Corners, the feet of buildings, the road under a car: where part
+   of the open sky is hidden, less of it lights the surface.  Worked
+   out from the depth buffer at half resolution — a hemisphere of
+   samples over each point, turned per pixel so the pattern averages
+   out — then blurred without bleeding across edges and laid over
+   the picture.  The radius grows with distance, so from high up the
+   streets still settle between the towers.
+   ------------------------------------------------------------ */
+const AO = { a: null, b: null, w: 0, h: 0, scene: new THREE.Scene() };
+function aoKernel(n){
+  const R = mulberry32(91), k = [];
+  for (let i = 0; i < n; i++){
+    const u = R(), v = R(), z = 0.3 + 0.7 * R();
+    const r = Math.sqrt(1 - z * z), a = u * Math.PI * 2;
+    const s = lerp(0.12, 1, Math.pow((i + v) / n, 2));
+    k.push(new THREE.Vector3(Math.cos(a) * r * s, Math.sin(a) * r * s, z * s));
+  }
+  return k;
+}
+AO.mat = new THREE.ShaderMaterial({
+  defines: { SAMPLES: 12 },
+  uniforms: {
+    tDepth: { value: null }, uProj: { value: new THREE.Matrix4() }, uInvProj: { value: new THREE.Matrix4() },
+    uKernel: { value: aoKernel(16) }, uTexel: { value: new THREE.Vector2() },
+    uRadius: { value: new THREE.Vector3(0.02, 0.6, 30) }, uFade: { value: new THREE.Vector2(1000, 3000) },
+  },
+  vertexShader: FULLSCREEN_VS,
+  fragmentShader: `
+    uniform sampler2D tDepth;
+    uniform mat4 uProj, uInvProj;
+    uniform vec3 uKernel[16];
+    uniform vec2 uTexel, uFade;
+    uniform vec3 uRadius;          // per metre of depth, least, most
+    varying vec2 vUv;
+    vec3 viewPos(vec2 uv){
+      float d = texture2D(tDepth, uv).r;
+      vec4 v = uInvProj * vec4(uv * 2.0 - 1.0, d * 2.0 - 1.0, 1.0);
+      return v.xyz / v.w;
+    }
+    void main(){
+      float d0 = texture2D(tDepth, vUv).r;
+      /* depth goes out in sixteenths of a metre, to stay inside half-float range */
+      if (d0 >= 1.0){ gl_FragColor = vec4(1.0, -4000.0, 0.0, 1.0); return; }
+      vec3 P = viewPos(vUv);
+      /* the surface normal, from whichever neighbour lies on the same surface */
+      vec3 pr = viewPos(vUv + vec2(uTexel.x, 0.0)) - P, pl = P - viewPos(vUv - vec2(uTexel.x, 0.0));
+      vec3 pu = viewPos(vUv + vec2(0.0, uTexel.y)) - P, pd = P - viewPos(vUv - vec2(0.0, uTexel.y));
+      vec3 N = normalize(cross(abs(pr.z) < abs(pl.z) ? pr : pl, abs(pu.z) < abs(pd.z) ? pu : pd));
+      float ang = 6.2831853 * fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+      vec3 r = vec3(cos(ang), sin(ang), 0.0);
+      vec3 T = normalize(r - N * dot(r, N)), B = cross(N, T);
+      float rad = clamp(-P.z * uRadius.x, uRadius.y, uRadius.z);
+      /* start a little off the surface, so paint and depth noise do not
+         shadow the surface they lie on */
+      vec3 O = P + N * rad * 0.06;
+      float occ = 0.0;
+      for (int i = 0; i < SAMPLES; i++){
+        vec3 k = uKernel[i];
+        vec3 s = O + (T * k.x + B * k.y + N * k.z) * rad;
+        vec4 c = uProj * vec4(s, 1.0);
+        vec2 uv = c.xy / c.w * 0.5 + 0.5;
+        float sz = viewPos(uv).z;
+        float range = smoothstep(0.0, 1.0, rad / max(abs(P.z - sz), 1e-4));
+        occ += step(s.z + rad * 0.05, sz) * range;
+      }
+      float ao = 1.0 - occ / float(SAMPLES);
+      ao = mix(ao, 1.0, smoothstep(uFade.x, uFade.y, -P.z));
+      gl_FragColor = vec4(ao, P.z * 0.0625, 0.0, 1.0);
+    }`,
+  depthTest: false, depthWrite: false,
+});
+/* seven taps along one axis, weighted down across depth edges */
+AO.blur = new THREE.ShaderMaterial({
+  uniforms: { tSrc: { value: null }, uStep: { value: new THREE.Vector2() } },
+  vertexShader: FULLSCREEN_VS,
+  fragmentShader: `
+    uniform sampler2D tSrc;
+    uniform vec2 uStep;
+    varying vec2 vUv;
+    void main(){
+      vec2 c0 = texture2D(tSrc, vUv).rg;
+      float sum = c0.r * 0.2, wsum = 0.2;
+      for (int i = 1; i <= 3; i++){
+        float g = i == 1 ? 0.17 : i == 2 ? 0.12 : 0.07;
+        for (int s = -1; s <= 1; s += 2){
+          vec2 t = texture2D(tSrc, vUv + uStep * float(i * s)).rg;
+          float w = g * exp(-abs(t.g - c0.g) / max(abs(c0.g) * 0.02, 0.003));
+          sum += t.r * w; wsum += w;
+        }
+      }
+      gl_FragColor = vec4(sum / wsum, c0.g, 0.0, 1.0);
+    }`,
+  depthTest: false, depthWrite: false,
+});
+AO.quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), AO.mat);
+AO.quad.frustumCulled = false;
+AO.scene.add(AO.quad);
+
+function aoTargets(w, h){
+  if (AO.a && AO.w === w && AO.h === h) return;
+  dropAOTargets();
+  const o = { type: THREE.HalfFloatType, depthBuffer: false, generateMipmaps: false,
+              magFilter: THREE.LinearFilter, minFilter: THREE.LinearFilter };
+  AO.a = new THREE.WebGLRenderTarget(w, h, o);
+  AO.b = new THREE.WebGLRenderTarget(w, h, o);
+  AO.w = w; AO.h = h;
+}
+function dropAOTargets(){
+  if (AO.a){ AO.a.dispose(); AO.b.dispose(); }
+  AO.a = AO.b = null; AO.w = AO.h = 0;
+}
+/* occlusion at half size, blurred across and then down */
+function renderAO(rt){
+  const n = Q.ao || 0;
+  if (!n){ if (AO.a) dropAOTargets(); return null; }
+  aoTargets(Math.max(1, POST.w >> 1), Math.max(1, POST.h >> 1));
+  const m = AO.mat;
+  if (m.defines.SAMPLES !== n){ m.defines.SAMPLES = n; m.needsUpdate = true; }
+  const u = m.uniforms;
+  u.tDepth.value = rt.depthTexture;
+  u.uProj.value.copy(camera.projectionMatrix);
+  u.uInvProj.value.copy(camera.projectionMatrixInverse);
+  u.uTexel.value.set(1 / POST.w, 1 / POST.h);
+  u.uFade.value.set(camera.far * 0.25, camera.far * 0.5);
+  AO.quad.material = m;
+  renderer.setRenderTarget(AO.a);
+  renderer.render(AO.scene, POST.cam);
+  const b = AO.blur.uniforms;
+  AO.quad.material = AO.blur;
+  b.tSrc.value = AO.a.texture; b.uStep.value.set(1 / AO.w, 0);
+  renderer.setRenderTarget(AO.b);
+  renderer.render(AO.scene, POST.cam);
+  b.tSrc.value = AO.b.texture; b.uStep.value.set(0, 1 / AO.h);
+  renderer.setRenderTarget(AO.a);
+  renderer.render(AO.scene, POST.cam);
+  return AO.a;
+}
+
+/* a floating-point colour buffer is needed; without one, stay direct */
+function postSupported(){
+  if (POST.ok === null){
+    const ext = renderer.extensions;
+    POST.ok = !!(renderer.capabilities.isWebGL2 && (ext.has('EXT_color_buffer_float') || ext.has('EXT_color_buffer_half_float')));
+  }
+  return POST.ok;
+}
+
+function postTarget(){
+  const w = Math.max(1, Math.round(VW * DPR * POST.scale)), h = Math.max(1, Math.round(VH * DPR * POST.scale));
+  const s = Q.msaa || 0;
+  if (POST.rt && POST.w === w && POST.h === h && POST.samples === s) return POST.rt;
+  dropPostTargets();
+  const rt = new THREE.WebGLRenderTarget(w, h, { type: THREE.HalfFloatType, samples: s, depthBuffer: true });
+  rt.texture.generateMipmaps = false;
+  rt.depthTexture = new THREE.DepthTexture(w, h);
+  rt.depthTexture.type = THREE.UnsignedIntType;       // 24-bit, like the screen's
+  POST.rt = rt; POST.w = w; POST.h = h; POST.samples = s;
+  return rt;
+}
+function dropPostTargets(){
+  if (POST.rt){ POST.rt.depthTexture.dispose(); POST.rt.dispose(); POST.rt = null; }
+  POST.w = POST.h = 0; POST.samples = -1;
+  dropBloomTargets();
+  dropAOTargets();
+}
+QUALITY_HOOKS.push(q => { if (!q.post) dropPostTargets(); });
+/* after a lost context the old targets died with it: forget them
+   rather than dispose them, which would reach into the dead context */
+cv.addEventListener('webglcontextrestored', () => {
+  POST.rt = null; POST.w = POST.h = 0; POST.samples = -1;
+  BLOOM.levels.length = 0; BLOOM.w = BLOOM.h = BLOOM.n = 0;
+  AO.a = AO.b = null; AO.w = AO.h = 0;
+  sun.shadow.map = null; sunFar.shadow.map = null;
+});
+toOverlay(surveyGrid);
+toOverlay(snapGrid);
+
+/* ------------------------------------------------------------
+   Colour grade
+
+   A light touch that follows the light: warm highlights and cool
+   shadows by day, richer and warmer at golden hour, bluer and
+   crisper at night, flatter and greyer in the rain.  With the
+   vignette and grain it replaces the page's CSS vignette, and it
+   sits under the editor overlays, whose colours are left alone.
+   ------------------------------------------------------------ */
+const GRADE = {
+  day:    { slope: [1.03, 1.0, 0.97], offset: [-0.004, -0.001, 0.006], sat: 1.06, contrast: 1.04 },
+  golden: { slope: [1.06, 1.0, 0.91], offset: [0.0, -0.002, 0.002],    sat: 1.12, contrast: 1.05 },
+  night:  { slope: [0.96, 1.0, 1.07], offset: [0.0, 0.002, 0.01],      sat: 0.94, contrast: 1.08 },
+  rain:   { slope: [0.98, 1.0, 1.02], offset: [0.0, 0.002, 0.004],     sat: 0.84, contrast: 0.98 },
+  cur: { slope: [1, 1, 1], offset: [0, 0, 0], sat: 1, contrast: 1 },
+};
+function gradeMix(a, b, t, out){
+  for (let i = 0; i < 3; i++){ out.slope[i] = lerp(a.slope[i], b.slope[i], t); out.offset[i] = lerp(a.offset[i], b.offset[i], t); }
+  out.sat = lerp(a.sat, b.sat, t); out.contrast = lerp(a.contrast, b.contrast, t);
+  return out;
+}
+let postFrame = 0;
+function updateGrade(u){
+  const g = GRADE.cur, E = ENVSTATE;
+  const golden = E.sunUp * (1 - smoothstep(0.08, 0.4, E.sunEl || 1));
+  gradeMix(GRADE.day, GRADE.golden, golden, g);
+  gradeMix(g, GRADE.night, E.dark, g);
+  gradeMix(g, GRADE.rain, E.rain * 0.8, g);
+  u.uSlope.value.fromArray(g.slope); u.uOffset.value.fromArray(g.offset);
+  u.uSat.value = g.sat; u.uContrast.value = g.contrast;
+  u.uVignette.value = lerp(0.12, 0.5, E.dark);
+  u.uGrain.value = lerp(1.5, 5, E.dark) / 255;
+  u.uFrame.value = postFrame = (postFrame + 1) % 64;
+}
+
+/* ------------------------------------------------------------
+   Dynamic resolution
+
+   When frames arrive late and the time is not going to the main
+   thread, the GPU is the bottleneck: the scene is then drawn at a
+   lower resolution and scaled up to the screen, while the overlays
+   and the UI, drawn afterwards, stay sharp.  Once frames are on time
+   again for a while the resolution climbs back, and if a climb does
+   not hold, the next attempt waits longer.
+   ------------------------------------------------------------ */
+const DYNRES = {
+  STEPS: [1, 0.9, 0.8, 0.7, 0.6, 0.5], i: 0, enabled: loadDynRes(),
+  iv: [], cpu: [], prev: 0, floor: 1000 / 60, last: 0, wait: 3, climbedAt: -1e9,
+};
+function loadDynRes(){
+  try { return localStorage.getItem('gridcontrol.dynres') !== '0'; } catch (e) { return true; }
+}
+function setDynRes(on){
+  DYNRES.enabled = !!on;
+  try { localStorage.setItem('gridcontrol.dynres', on ? '1' : '0'); } catch (e) {}
+  if (!on) setDynScale(0);
+}
+function setDynScale(i, now){
+  const D = DYNRES;
+  D.i = i; D.last = now || performance.now();
+  D.iv.length = D.cpu.length = 0;
+  POST.scale = D.STEPS[i];
+  paintQualityControl();
+}
+const median = a => { const s = a.slice().sort((x, y) => x - y); return s[s.length >> 1]; };
+/* called once per frame with the main thread's share of it */
+function dynResSample(now, cpuMs){
+  const D = DYNRES;
+  if (!D.enabled || !(Q.post && postSupported()) || document.hidden){
+    D.prev = 0; D.iv.length = D.cpu.length = 0;
+    return;
+  }
+  if (D.prev){
+    const dt = now - D.prev;
+    /* the display's own frame interval: the quickest frames seen,
+       slowly forgotten, and never read as faster than 60 Hz */
+    D.floor = Math.max(1000 / 60, Math.min(D.floor + 0.02, dt));
+    D.iv.push(dt); D.cpu.push(cpuMs);
+    if (D.iv.length > 40){ D.iv.shift(); D.cpu.shift(); }
+  }
+  D.prev = now;
+  /* judge on forty frames, or on two seconds' worth when frames are slow */
+  const n = D.iv.length;
+  if (now - D.last < 1500 || (n < 40 && (n < 6 || D.iv.reduce((a, b) => a + b, 0) < 2000))) return;
+  const iv = median(D.iv), cpu = median(D.cpu);
+  if (iv > D.floor * 1.3 && cpu < iv * 0.6 && D.i < D.STEPS.length - 1){
+    if (now - D.climbedAt < 5000){ D.wait = Math.min(D.wait * 2, 60); D.climbedAt = -1e9; }   // the last climb did not hold
+    setDynScale(D.i + 1, now);
+  } else if (iv < D.floor * 1.1 && D.i > 0 && now - D.last > D.wait * 1000){
+    D.climbedAt = now;
+    setDynScale(D.i - 1, now);
+  }
+}
+QUALITY_HOOKS.push(() => { if (DYNRES.i) setDynScale(0); DYNRES.wait = 3; });
+
+/* draw one frame: the scene, then (if on) the effects, then overlays */
+function renderFrame(){
+  renderer.info.reset();
+  renderer.shadowMap.needsUpdate = true;
+  const post = Q.post && postSupported();
+  if (!post){
+    camera.layers.enable(LAYER_OVERLAY);
+    camera.layers.enable(LAYER_SCREENFX);
+    renderer.setRenderTarget(null);
+    renderer.render(scene, camera);
+    camera.layers.set(0);
+    return;
+  }
+  const rt = postTarget();
+  camera.layers.set(0);
+  renderer.setRenderTarget(rt);
+  renderer.render(scene, camera);
+
+  const bloom = renderBloom(rt);
+  const ao = renderAO(rt);
+  const u = POST.composite.uniforms;
+  u.tColor.value = rt.texture;
+  u.tDepth.value = rt.depthTexture;
+  u.uExposure.value = renderer.toneMappingExposure;
+  u.tBloom.value = bloom ? bloom.texture : null;
+  u.uBloom.value = bloom ? lerp(0.05, 0.14, ENVSTATE.dark) + 0.05 * ENVSTATE.rain : 0;
+  u.uBloomNorm.value = bloom ? 1 / BLOOM.levels.length : 1;
+  u.uSharpen.value = POST.scale < 1 ? Math.min(1, (1 - POST.scale) * 2.5) : 0;
+  u.uSrcTexel.value.set(1 / POST.w, 1 / POST.h);
+  u.tAO.value = ao ? ao.texture : null;
+  u.uAO.value = ao ? 0.85 * (1 - 0.5 * ENVSTATE.dark) : 0;
+  updateGrade(u);
+  renderer.setRenderTarget(null);
+  renderer.render(POST.scene, POST.cam);
+
+  /* light effects and overlays, over the finished picture and
+     against its depth */
+  camera.layers.set(LAYER_OVERLAY);
+  camera.layers.enable(LAYER_SCREENFX);
+  renderer.autoClear = false;
+  renderer.render(scene, camera);
+  renderer.autoClear = true;
+  camera.layers.set(0);
 }
 
 /* ------------------------------------------------------------
@@ -5218,7 +6680,7 @@ const PAINT_W = C3('#e2e6ec'), PAINT_Y = C3('#d6a53a');
 const SIG_COL = {
   red: C3('#FF5A4E'), yellow: C3('#FFC53D'), green: C3('#3FD07A'), off: C3('#17191d'),
 };
-const MAT_WALK_FLAT = MAT.walk.clone();
+const MAT_WALK_FLAT = atmospherePatch(MAT.walk.clone(), 'lit');
 MAT_WALK_FLAT.polygonOffset = true; MAT_WALK_FLAT.polygonOffsetFactor = 1; MAT_WALK_FLAT.polygonOffsetUnits = 1;
 
 function addMesh(group, buf, mat, opts){
@@ -5227,6 +6689,7 @@ function addMesh(group, buf, mat, opts){
   m.receiveShadow = !!(opts && opts.receive);
   m.castShadow = !!(opts && opts.cast);
   if (opts && opts.order) m.renderOrder = opts.order;
+  if (opts && opts.layer) m.layers.set(opts.layer);
   group.add(m);
   return m;
 }
@@ -5516,10 +6979,10 @@ function bendMarkings3D(n, main, fine, y){
    additive halo so the state reads from a long way out
    ------------------------------------------------------------ */
 const TINT = { mesh: null, glow: null, list: [] };
-const MAT_TINT = new THREE.MeshBasicMaterial({ vertexColors: true, toneMapped: false, transparent: true, opacity: 0.85,
-  depthWrite: false, polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -6 });
-const MAT_TINT_GLOW = new THREE.MeshBasicMaterial({ vertexColors: true, toneMapped: false, transparent: true,
-  blending: THREE.AdditiveBlending, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -6 });
+const MAT_TINT = atmospherePatch(new THREE.MeshBasicMaterial({ vertexColors: true, toneMapped: false, transparent: true, opacity: 0.85,
+  depthWrite: false, polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -6 }), 'basic');
+const MAT_TINT_GLOW = atmospherePatch(new THREE.MeshBasicMaterial({ vertexColors: true, toneMapped: false, transparent: true,
+  blending: THREE.AdditiveBlending, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -6 }), 'add');
 
 function buildStopBarTints(){
   TINT.list.length = 0;
@@ -5566,7 +7029,7 @@ function buildStopBarTints(){
     }
   }
   TINT.mesh = addMesh(STATIC3D, bar, MAT_TINT, { order: 4 });
-  TINT.glow = addMesh(STATIC3D, glow, MAT_TINT_GLOW, { order: 4 });
+  TINT.glow = addMesh(STATIC3D, glow, MAT_TINT_GLOW, { order: 4, layer: LAYER_SCREENFX });
 }
 
 /* the most permissive state among a set of movement groups */
@@ -5603,8 +7066,8 @@ function updateStopBarTints(){
 /* ------------------------------------------------------------
    Portals — chevrons show where traffic enters and leaves
    ------------------------------------------------------------ */
-const MAT_PORTAL = new THREE.MeshBasicMaterial({ vertexColors: true, toneMapped: false, transparent: true, opacity: 0.8,
-  depthWrite: false, polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -6 });
+const MAT_PORTAL = atmospherePatch(new THREE.MeshBasicMaterial({ vertexColors: true, toneMapped: false, transparent: true, opacity: 0.8,
+  depthWrite: false, polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -6 }), 'basic');
 function buildPortalMarks(){
   const buf = new GeoBuf(false, true);
   const IN = C3('#3FD07A'), OUT = C3('#FFB43D'), SHUT = C3('#FF5A4E');
@@ -6038,11 +7501,11 @@ function buildStreetLamps(){
   const poles = new InstPool(GEO_POLE, MAT.metal, kept.length, { color: false, cast: true, parent: CITY3D });
   const arms = new InstPool(GEO_BOX, MAT.metal, kept.length, { color: false, parent: CITY3D });
   const heads = new InstPool(GEO_BOX, MAT.lampHead, kept.length, { color: false, parent: CITY3D });
-  const pm = new THREE.MeshBasicMaterial({ map: TEX_GLOW, color: C3('#ffcf94'), transparent: true, opacity: 0,
+  const pm = atmospherePatch(new THREE.MeshBasicMaterial({ map: TEX_GLOW, color: C3('#ffcf94'), transparent: true, opacity: 0,
     blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false,
-    polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -8 });
+    polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -8 }), 'add');
   CITY3D.poolMat = pm;
-  const pools = new InstPool(GEO_FLAT, pm, kept.length, { color: false, parent: CITY3D, order: 6 });
+  const pools = new InstPool(GEO_FLAT, pm, kept.length, { color: false, parent: CITY3D, order: 6, layer: LAYER_SCREENFX });
   poles.begin(); arms.begin(); heads.begin(); pools.begin();
   for (const s of kept){
     const L = Math.hypot(s.dx, s.dy) || 1;
@@ -6065,16 +7528,17 @@ class GlowLayer {
   constructor(cap){
     this.cap = 0; this.n = 0;
     this.mat = new THREE.ShaderMaterial({
-      uniforms: { uScale: { value: 500 } },
+      uniforms: { uScale: { value: 500 }, uFog: ATMU.uFog },
       vertexShader: `
         attribute float aSize; attribute vec3 aCol;
         uniform float uScale;
         varying vec3 vCol;
+        ${GLSL_ATM_FOG}
         void main(){
           vec4 mv = modelViewMatrix * vec4(position, 1.0);
           gl_Position = projectionMatrix * mv;
           gl_PointSize = clamp(aSize * uScale / max(-mv.z, 0.1), 2.5, 220.0);
-          vCol = aCol;
+          vCol = aCol * (1.0 - atmFogAmount((modelMatrix * vec4(position, 1.0)).xyz));
         }`,
       fragmentShader: `
         varying vec3 vCol;
@@ -6090,7 +7554,7 @@ class GlowLayer {
     this.pts = new THREE.Points(this.geo, this.mat);
     this.pts.frustumCulled = false;
     this.pts.renderOrder = 20;
-    scene.add(this.pts);
+    scene.add(toScreenFx(this.pts));
     this.grow(cap);
   }
   grow(cap){
@@ -6128,16 +7592,16 @@ const GLOWS = new GlowLayer(1024);
    the raw tangent would twitch), and a body pitch and roll that
    follow braking and cornering.
    ------------------------------------------------------------ */
-const MAT_BEAM = new THREE.MeshBasicMaterial({ map: TEX_BEAM, color: C3('#ffe7c2'), transparent: true, opacity: 0,
+const MAT_BEAM = atmospherePatch(new THREE.MeshBasicMaterial({ map: TEX_BEAM, color: C3('#ffe7c2'), transparent: true, opacity: 0,
   blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false,
-  polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -8 });
-const MAT_BLOB = new THREE.MeshBasicMaterial({ map: TEX_GLOW, color: 0x000000, transparent: true, opacity: 0.55,
-  depthWrite: false, polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -6 });
+  polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -8 }), 'add');
+const MAT_BLOB = atmospherePatch(new THREE.MeshBasicMaterial({ map: TEX_GLOW, color: 0x000000, transparent: true, opacity: 0.55,
+  depthWrite: false, polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -6 }), 'basic');
 const VEH = {
   box:   new InstPool(GEO_BOX, MAT.vehicle, 2048, { cast: true, receive: true }),
   wheel: new InstPool(GEO_WHEEL, MAT.tyre, 2048, { color: false }),
   light: new InstPool(GEO_BOX, MAT.lamp, 2048, {}),
-  beam:  new InstPool(GEO_FLAT, MAT_BEAM, 256, { color: false, order: 7 }),
+  beam:  new InstPool(GEO_FLAT, MAT_BEAM, 256, { color: false, order: 7, layer: LAYER_SCREENFX }),
   blob:  new InstPool(GEO_FLAT, MAT_BLOB, 256, { color: false, order: 1 }),
 };
 const VC = {
@@ -6409,7 +7873,7 @@ function buildHeat3D(){
   if (buf.empty) return;
   HEAT3D.mesh = new THREE.Mesh(buf.geometry(), MAT_HEAT);
   HEAT3D.mesh.renderOrder = 5;
-  scene.add(HEAT3D.mesh);
+  scene.add(toOverlay(HEAT3D.mesh));
 }
 function paintHeat3D(){
   if (!HEAT3D.mesh) return;
@@ -6444,7 +7908,7 @@ function buildDetectors3D(){
   if (buf.empty) return;
   DET3D.mesh = new THREE.Mesh(buf.geometry(), MAT_DET);
   DET3D.mesh.renderOrder = 5;
-  scene.add(DET3D.mesh);
+  scene.add(toOverlay(DET3D.mesh));
 }
 const DET_OK = C3('#5AA9D6'), DET_Q = C3('#FF5A4E');
 function paintDetectors3D(){
@@ -6513,14 +7977,16 @@ const RAIN3D = (() => {
       }`,
     fragmentShader: `
       uniform vec3 uCol; uniform float uAlpha; varying float vA;
-      void main(){ gl_FragColor = vec4(uCol, uAlpha * vA); }`,
+      void main(){
+        gl_FragColor = vec4(uCol, uAlpha * vA);
+      }`,
     transparent: true, depthWrite: false, fog: false,
   });
   const lines = new THREE.LineSegments(g, m);
   lines.frustumCulled = false;
   lines.renderOrder = 30;
   lines.visible = false;
-  scene.add(lines);
+  scene.add(toScreenFx(lines));
   return { lines, m };
 })();
 function updateRain(tReal){
@@ -6593,7 +8059,7 @@ class FatLines {
     this.mesh.renderOrder = o.order || 40;
     this.mesh.visible = false;
     this.key = null;
-    scene.add(this.mesh);
+    scene.add(toOverlay(this.mesh));
   }
   set width(w){ this.mat.uniforms.uWidth.value = w; }
   dashes(on, off){ this.mat.uniforms.uDash.value = on; this.mat.uniforms.uGap.value = off; }
@@ -6671,7 +8137,7 @@ class Handles {
     this.pts.frustumCulled = false;
     this.pts.renderOrder = order || 45;
     this.pts.visible = false;
-    scene.add(this.pts);
+    scene.add(toOverlay(this.pts));
   }
   /* list: [{ x, y, h, col, a, size, ring }] */
   set(list){
@@ -6713,7 +8179,7 @@ const OVL = {
     const m = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshBasicMaterial({
       color: OC.cyan, transparent: true, opacity: 0.26, depthTest: false, depthWrite: false, side: THREE.DoubleSide, toneMapped: false }));
     m.renderOrder = 43; m.frustumCulled = false; m.visible = false;
-    scene.add(m);
+    scene.add(toOverlay(m));
     return m;
   })(),
 };
@@ -6950,7 +8416,7 @@ const TRAILS3D = (() => {
   const m = new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, depthWrite: false, toneMapped: false });
   const l = new THREE.LineSegments(g, m);
   l.frustumCulled = false; l.renderOrder = 29; l.visible = false;
-  scene.add(l);
+  scene.add(toOverlay(l));
   return { l, g, cap: 0, P: null, C: null };
 })();
 function updateTrails3D(){
@@ -7022,7 +8488,7 @@ let RENDER_LEAD = 0;          // sim seconds accumulated but not yet stepped
 
 function draw(dtReal){
   applyCam();
-  updateEnvironment();
+  updateEnvironment(dtReal);
   /* cut away buildings on the line of sight when close and low */
   XRAY.uXray.value = CFG.xray && CAM.dist < 520 && CAM.pitch < 1.3 ? clamp(CAM.dist * 0.17, 9, 48) : 0;
   XRAY.uCamPos.value.copy(camera.position);
@@ -7048,7 +8514,7 @@ function draw(dtReal){
   MAT.paintFine.opacity = fine;
   if (STAT.fineMesh) STAT.fineMesh.visible = fine > 0.02;
 
-  renderer.render(scene, camera);
+  renderFrame();
 
   updateEdLabel();
   drawScaleBar();
@@ -7209,6 +8675,264 @@ function worstApproach(){
     if (!best || l.queue > best.queue) best = { queue: l.queue, name: l.to.name, link: l };
   }
   return best;
+}
+
+/* ============================================================
+   7.2 · SOUND — the city, synthesised
+
+   Nothing is recorded: every sound is noise or an oscillator shaped
+   by filters, so the page stays a single file.  The mix follows the
+   view — tyres and engines from the traffic near its centre, panned
+   to where they are; a distant rumble that takes over as the camera
+   pulls back; wind that rises with height; rain; birds by day and
+   crickets at night; a horn when a queue has sat too long; a siren
+   when an emergency vehicle is near.  Browsers only let a page make
+   sound once it has been touched, so it starts on the first press.
+   ============================================================ */
+const AUDIO = {
+  ctx: null, on: true, vol: 0.5, n: null, next: { bird: 0, cricket: 0, horn: 0 }, lastMix: 0,
+};
+(() => {
+  try {
+    const s = JSON.parse(localStorage.getItem('gridcontrol.sound') || '{}');
+    if (typeof s.on === 'boolean') AUDIO.on = s.on;
+    if (typeof s.vol === 'number' && s.vol >= 0 && s.vol <= 1) AUDIO.vol = s.vol;
+  } catch (e) {}
+})();
+function saveSound(){
+  try { localStorage.setItem('gridcontrol.sound', JSON.stringify({ on: AUDIO.on, vol: AUDIO.vol })); } catch (e) {}
+}
+
+/* a few seconds of pink or brown noise, looped */
+function noiseBuffer(ctx, kind){
+  const len = Math.floor(ctx.sampleRate * 3), buf = ctx.createBuffer(1, len, ctx.sampleRate), d = buf.getChannelData(0);
+  let b0 = 0, b1 = 0, b2 = 0, b3 = 0, b4 = 0, b5 = 0, b6 = 0, last = 0;
+  for (let i = 0; i < len; i++){
+    const w = Math.random() * 2 - 1;
+    if (kind === 'brown'){ last = (last + 0.02 * w) / 1.02; d[i] = last * 3.5; continue; }
+    b0 = 0.99886 * b0 + w * 0.0555179; b1 = 0.99332 * b1 + w * 0.0750759; b2 = 0.969 * b2 + w * 0.153852;
+    b3 = 0.8665 * b3 + w * 0.3104856; b4 = 0.55 * b4 + w * 0.5329522; b5 = -0.7616 * b5 - w * 0.016898;
+    d[i] = (b0 + b1 + b2 + b3 + b4 + b5 + b6 + w * 0.5362) * 0.11;
+    b6 = w * 0.115926;
+  }
+  /* fade the seam so the loop does not click */
+  const f = Math.floor(ctx.sampleRate * 0.02);
+  for (let i = 0; i < f; i++){ const k = i / f; d[i] *= k; d[len - 1 - i] *= k; }
+  return buf;
+}
+
+function audioStart(){
+  if (AUDIO.ctx || !AUDIO.on) return;
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) return;
+  let ctx;
+  try { ctx = new AC(); } catch (e) { return; }
+  AUDIO.ctx = ctx;
+  const master = ctx.createGain();
+  master.gain.value = 0;
+  const comp = ctx.createDynamicsCompressor();
+  /* catches peaks only: a lower threshold brings automatic make-up
+     gain, which would lift a quiet night as loud as a busy street */
+  comp.threshold.value = -6; comp.knee.value = 6; comp.ratio.value = 3;
+  master.connect(comp);
+  comp.connect(ctx.destination);
+  const meter = ctx.createAnalyser();          // for level checks
+  meter.fftSize = 1024;
+  comp.connect(meter);
+  const pink = noiseBuffer(ctx, 'pink'), brown = noiseBuffer(ctx, 'brown');
+  /* a looping bed: noise → filter → gain (→ pan) → master */
+  const bed = (buf, type, freq, q, pan) => {
+    const src = ctx.createBufferSource();
+    src.buffer = buf; src.loop = true;
+    src.loopStart = Math.random() * 1.5;
+    const f = ctx.createBiquadFilter();
+    f.type = type; f.frequency.value = freq; f.Q.value = q;
+    const g = ctx.createGain();
+    g.gain.value = 0;
+    src.connect(f); f.connect(g);
+    let out = g;
+    if (pan && ctx.createStereoPanner){ const p = ctx.createStereoPanner(); g.connect(p); out = p; }
+    out.connect(master);
+    src.start(ctx.currentTime + Math.random() * 0.2);
+    return { f, g, p: out !== g ? out : null };
+  };
+  const n = {
+    master, meter,
+    rumble: bed(brown, 'lowpass', 160, 0.5, false),
+    tyres: bed(pink, 'bandpass', 800, 0.55, true),
+    engine: bed(brown, 'bandpass', 110, 1.1, true),
+    rain: bed(pink, 'highpass', 2200, 0.4, false),
+    wind: bed(brown, 'lowpass', 380, 0.9, false),
+  };
+  /* gusts: a slow wobble on the wind's filter */
+  const gust = ctx.createOscillator(), gustDepth = ctx.createGain();
+  gust.frequency.value = 0.07; gustDepth.gain.value = 170;
+  gust.connect(gustDepth); gustDepth.connect(n.wind.f.frequency);
+  gust.start();
+  /* the siren wails between two pitches */
+  const siren = ctx.createOscillator(), sirenLfo = ctx.createOscillator(), sirenDepth = ctx.createGain();
+  siren.type = 'triangle'; siren.frequency.value = 960;
+  sirenLfo.frequency.value = 0.55; sirenDepth.gain.value = 330;
+  sirenLfo.connect(sirenDepth); sirenDepth.connect(siren.frequency);
+  const sirenF = ctx.createBiquadFilter(); sirenF.type = 'lowpass'; sirenF.frequency.value = 2400;
+  const sirenG = ctx.createGain(); sirenG.gain.value = 0;
+  const sirenP = ctx.createStereoPanner ? ctx.createStereoPanner() : null;
+  siren.connect(sirenF); sirenF.connect(sirenG);
+  if (sirenP){ sirenG.connect(sirenP); sirenP.connect(master); } else sirenG.connect(master);
+  siren.start(); sirenLfo.start();
+  n.siren = { g: sirenG, p: sirenP };
+  AUDIO.n = n;
+  document.addEventListener('visibilitychange', () => {
+    if (!AUDIO.ctx) return;
+    if (document.hidden) AUDIO.ctx.suspend().catch(() => {});
+    else if (AUDIO.on) AUDIO.ctx.resume().catch(() => {});
+  });
+}
+
+/* the first press anywhere starts (or wakes) the sound */
+function audioWake(){
+  if (!AUDIO.on) return;
+  audioStart();
+  if (AUDIO.ctx && AUDIO.ctx.state !== 'running') AUDIO.ctx.resume().catch(() => {});
+}
+window.addEventListener('pointerdown', audioWake, true);
+window.addEventListener('keydown', audioWake, true);
+
+function setSound(on){
+  AUDIO.on = !!on;
+  saveSound();
+  if (AUDIO.on) audioWake();
+  else if (AUDIO.ctx){
+    const m = AUDIO.n.master.gain, t = AUDIO.ctx.currentTime;
+    m.cancelScheduledValues(t); m.setTargetAtTime(0, t, 0.05);
+    setTimeout(() => { if (!AUDIO.on && AUDIO.ctx) AUDIO.ctx.suspend().catch(() => {}); }, 300);
+  }
+}
+function setVolume(v){
+  AUDIO.vol = clamp(v, 0, 1);
+  saveSound();
+}
+
+/* one-shot voices ------------------------------------------- */
+function voice(type, f0, dur, level, pan, when){
+  const ctx = AUDIO.ctx, t = when || ctx.currentTime + 0.02;
+  const o = ctx.createOscillator(), g = ctx.createGain();
+  o.type = type;
+  g.gain.setValueAtTime(0, t);
+  g.gain.linearRampToValueAtTime(level, t + Math.min(0.012, dur * 0.2));
+  g.gain.setTargetAtTime(0, t + dur * 0.5, dur * 0.25);
+  o.connect(g);
+  let out = g;
+  if (ctx.createStereoPanner){ const p = ctx.createStereoPanner(); p.pan.value = clamp(pan, -1, 1); g.connect(p); out = p; }
+  out.connect(AUDIO.n.master);
+  o.frequency.setValueAtTime(f0, t);
+  o.start(t); o.stop(t + dur * 2 + 0.1);
+  return o.frequency;
+}
+function chirp(level, pan){
+  const t = AUDIO.ctx.currentTime + 0.02, base = 2600 + Math.random() * 1800, n = 1 + Math.floor(Math.random() * 4);
+  for (let i = 0; i < n; i++){
+    const d = 0.06 + Math.random() * 0.06, at = t + i * (d + 0.05 + Math.random() * 0.06);
+    const f = voice('sine', base, d, level * (0.6 + Math.random() * 0.4), pan, at);
+    f.setValueAtTime(base * (0.9 + Math.random() * 0.2), at);
+    f.exponentialRampToValueAtTime(base * (1.15 + Math.random() * 0.35), at + d * 0.6);
+    f.exponentialRampToValueAtTime(base * (0.8 + Math.random() * 0.2), at + d);
+  }
+}
+function cricket(level, pan){
+  const ctx = AUDIO.ctx, t = ctx.currentTime + 0.02, dur = 0.15 + Math.random() * 0.2;
+  const o = ctx.createOscillator(), am = ctx.createOscillator(), amG = ctx.createGain(), g = ctx.createGain();
+  o.frequency.value = 4200 + Math.random() * 600;
+  am.frequency.value = 26 + Math.random() * 8;
+  amG.gain.value = level * 0.5;
+  g.gain.setValueAtTime(0, t);
+  g.gain.linearRampToValueAtTime(level * 0.5, t + 0.02);
+  g.gain.setTargetAtTime(0, t + dur, 0.03);
+  am.connect(amG); amG.connect(g.gain);
+  o.connect(g);
+  let out = g;
+  if (ctx.createStereoPanner){ const p = ctx.createStereoPanner(); p.pan.value = clamp(pan, -1, 1); g.connect(p); out = p; }
+  out.connect(AUDIO.n.master);
+  o.start(t); am.start(t); o.stop(t + dur + 0.12); am.stop(t + dur + 0.12);
+}
+function horn(level, pan){
+  const ctx = AUDIO.ctx, t = ctx.currentTime + 0.02, dur = 0.18 + Math.random() * 0.35;
+  const f = ctx.createBiquadFilter();
+  f.type = 'lowpass'; f.frequency.value = 1400;
+  const g = ctx.createGain();
+  g.gain.setValueAtTime(0, t);
+  g.gain.linearRampToValueAtTime(level, t + 0.015);
+  g.gain.setValueAtTime(level, t + dur);
+  g.gain.linearRampToValueAtTime(0, t + dur + 0.04);
+  f.connect(g);
+  let out = g;
+  if (ctx.createStereoPanner){ const p = ctx.createStereoPanner(); p.pan.value = clamp(pan, -1, 1); g.connect(p); out = p; }
+  out.connect(AUDIO.n.master);
+  for (const hz of [340 + Math.random() * 60, 430 + Math.random() * 60]){
+    const o = ctx.createOscillator();
+    o.type = 'square'; o.frequency.value = hz;
+    o.connect(f); o.start(t); o.stop(t + dur + 0.1);
+  }
+}
+
+/* the mix, a few times a second ------------------------------ */
+const _ear = { rx: 1, ry: 0 };
+function updateAudio(now){
+  const A = AUDIO;
+  if (!A.ctx || A.ctx.state !== 'running' || now - A.lastMix < 100) return;
+  A.lastMix = now;
+  const ctx = A.ctx, n = A.n, t = ctx.currentTime, E = ENVSTATE;
+  const set = (param, v, tc) => param.setTargetAtTime(v, t, tc || 0.25);
+  set(n.master.gain, A.on ? A.vol * 0.9 : 0, 0.1);
+
+  /* the listener stands at the view's centre, facing up the screen */
+  const R = clamp(CAM.dist * 0.6, 25, 350);
+  _ear.rx = Math.cos(CAM.yaw); _ear.ry = -Math.sin(CAM.yaw);
+  const moving = SIM.running;
+  let tyres = 0, engine = 0, panW = 0, panS = 0, stopped = 0, stopPan = 0, near = 0;
+  let siren = 0, sirenPan = 0;
+  for (const v of SIM.vehicles){
+    if (!v.seg) continue;
+    const p = renderPose(v, 0), dx = p.x - CAM.x, dy = p.y - CAM.y, d2 = dx * dx + dy * dy;
+    if (d2 > 9 * R * R) continue;
+    const w = 1 / (1 + d2 / (R * R)), side = clamp((dx * _ear.rx + dy * _ear.ry) / R, -1, 1);
+    if (v.emerg){ const s = 1 / (1 + d2 / (4 * R * R)); if (s > siren){ siren = s; sirenPan = side; } }
+    if (!moving) continue;
+    near += w;
+    tyres += w * Math.min(v.v / 14, 1.6);
+    engine += w * (0.35 + Math.min(v.v / 20, 1));
+    panW += w * (0.2 + v.v / 14); panS += side * w * (0.2 + v.v / 14);
+    if (v.stopTime > 12 && d2 < R * R){ stopped++; stopPan = side; }
+  }
+  const close = 1 / (1 + CAM.dist / 350);               // detail fades as the camera pulls back
+  const pan = panW > 0 ? clamp(panS / panW, -0.8, 0.8) : 0;
+  set(n.tyres.g.gain, moving ? 0.65 * Math.min(Math.sqrt(tyres), 3) * close : 0);
+  set(n.engine.g.gain, moving ? 0.9 * Math.min(Math.sqrt(engine), 3) * close : 0);
+  if (n.tyres.p) set(n.tyres.p.pan, pan * 0.7);
+  if (n.engine.p) set(n.engine.p.pan, pan * 0.5);
+  set(n.engine.f.frequency, 90 + 60 * Math.min(near ? engine / near : 0, 1.5), 0.6);
+  const total = moving ? SIM.vehicles.length : 0;
+  set(n.rumble.g.gain, 1.2 * Math.sqrt(total / 250) * (0.35 + 0.65 * (1 - close)), 0.8);
+  const height = camera.position.y;
+  set(n.wind.g.gain, 0.05 + 0.25 * smoothstep(150, 3000, height) + 0.12 * E.rain, 1);
+  set(n.rain.g.gain, 0.25 * E.rain * (0.6 + 0.4 * close), 0.6);
+  set(n.siren.g.gain, moving ? 0.12 * siren : 0, 0.15);
+  if (n.siren.p) set(n.siren.p.pan, sirenPan * 0.8, 0.1);
+
+  /* one-shots: birds by day, crickets at night, a horn in a jam */
+  const s = now / 1000, calm = E.rain < 0.25;
+  if (calm && E.sunUp > 0.6 && CAM.dist < 700 && s > A.next.bird){
+    chirp(0.05 * close * (1 - E.dark), Math.random() * 1.6 - 0.8);
+    A.next.bird = s + 0.8 + Math.random() * 3.5;
+  }
+  if (calm && E.dark > 0.6 && CAM.dist < 900 && s > A.next.cricket){
+    cricket(0.035 * close, Math.random() * 1.6 - 0.8);
+    A.next.cricket = s + 0.4 + Math.random() * 1.4;
+  }
+  if (moving && stopped >= 4 && s > A.next.horn){
+    if (Math.random() < 0.35) horn(0.05 * close, stopPan);
+    A.next.horn = s + 6 + Math.random() * 14;
+  }
 }
 /* ============================================================
    7.5 · EDITOR
@@ -7747,6 +9471,47 @@ function bindTog(id, apply){
 }
 
 function setupControls(){
+  /* The console fills the window and never scrolls.  Should focus ever
+     drag the page itself off-screen — a control laid out beyond the
+     fold — put it straight back rather than leave a blank screen that
+     nothing can scroll back. */
+  const pin = () => {
+    if (window.scrollX || window.scrollY) window.scrollTo(0, 0);
+    for (const el of [document.documentElement, document.body, $('app'), $('main')])
+      if (el && (el.scrollTop || el.scrollLeft)){ el.scrollTop = 0; el.scrollLeft = 0; }
+  };
+  window.addEventListener('scroll', pin, { passive: true });
+  document.addEventListener('scroll', e => { if (e.target === document || e.target.id === 'app' || e.target.id === 'main') pin(); }, { capture: true, passive: true });
+  document.addEventListener('focusin', () => requestAnimationFrame(pin));
+
+  /* A button clicked with the mouse lets go of the keyboard, so Enter
+     or Space later cannot press it again by surprise.  (Tabbing to a
+     button and pressing Enter still works: that click has no detail.) */
+  document.addEventListener('click', e => {
+    const b = e.target.closest && e.target.closest('button');
+    if (b && e.detail > 0) b.blur();
+  });
+
+  /* A file dropped on the page is opened by the browser, navigating
+     away and losing the network.  Take it instead: a saved network
+     loads (and can be undone), anything else is turned away. */
+  const carriesFile = e => e.dataTransfer && [...e.dataTransfer.types].some(t => t === 'Files' || t === 'text/uri-list');
+  window.addEventListener('dragover', e => { if (carriesFile(e)){ e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; } });
+  window.addEventListener('drop', e => {
+    if (!carriesFile(e)) return;
+    e.preventDefault();
+    const f = e.dataTransfer.files && e.dataTransfer.files[0];
+    if (f && (/\.json$/i.test(f.name) || f.type === 'application/json')) importPlan(f);
+    else toast('Drop a saved network (.json) here to load it');
+  });
+
+  /* closing or reloading throws away edits that were never exported */
+  window.addEventListener('beforeunload', e => {
+    if (!planDirty()) return;
+    e.preventDefault();
+    e.returnValue = '';
+  });
+
   bindRange('sInflow', v => CFG.inflow = v, v => `${v} veh/h`);
   bindRange('sTruck',  v => CFG.truckPct = v, v => `${v}%`);
   bindRange('sBias',   v => CFG.bias = v, v =>
@@ -7785,15 +9550,27 @@ function setupControls(){
   bindTog('tClock', v => CFG.advanceClock = v);
   bindRange('sRain', v => CFG.rain = v, v => v === 0 ? 'Dry' : v < 35 ? `Light · ${v}%` : v < 70 ? `Steady · ${v}%` : `Heavy · ${v}%`);
   bindTog('tPeds', v => CFG.peds = v);
+  bindTog('tSound', v => setSound(v));
+  $('sVolume').value = Math.round(AUDIO.vol * 100);
+  bindRange('sVolume', v => setVolume(v / 100), v => `${v}%`);
 
   bindTog('tHeat', v => CFG.heat = v);
   bindTog('tDetect', v => CFG.detectors = v);
   bindTog('tBuild', v => { CFG.buildings = v; buildCity(); cityDirty = false; });
   bindTog('tShadows', v => { CFG.shadows = v; });
   bindTog('tXray', v => { CFG.xray = v; });
+  bindTog('tDynRes', v => setDynRes(v));
   bindTog('tTrees', v => { CFG.trees = v; buildCity(); cityDirty = false; });
   bindTog('tLights', v => CFG.headlights = v);
   bindTog('tTrails', v => { CFG.trails = v; if (!v) for (const x of SIM.vehicles) x.trail.length = 0; });
+
+  document.querySelectorAll('#qualitySeg button').forEach(b => {
+    b.addEventListener('click', () => {
+      setQuality(b.dataset.q);
+      toast(`Graphics: ${qualityChoice === 'auto' ? 'Auto (' + QUALITY[qualityAuto].name + ')' : Q.name}`);
+    });
+  });
+  paintQualityControl();
 
   document.querySelectorAll('#colorSeg button').forEach(b => {
     b.addEventListener('click', () => {
@@ -7811,7 +9588,7 @@ function setupControls(){
   $('btnReset').addEventListener('click', () => { resetTraffic(); toast('Simulation restarted'); });
   $('btnClear').addEventListener('click', () => {
     for (const v of SIM.vehicles.slice()) despawn(v, false);
-    toast('Network cleared');
+    toast('Traffic cleared');
   });
   $('btnFit').addEventListener('click', () => fitView());
   $('compass').addEventListener('click', () => { CAM.chase = false; CAM.tyaw = CAM.yaw + angDiff(CAM.yaw, 0); });
@@ -7857,7 +9634,7 @@ function syncControls(){
     tAdaptive: CFG.adaptive, tProtLeft: CFG.protLeft, tPreempt: CFG.preempt,
     tClock: CFG.advanceClock, tPeds: CFG.peds, tHeat: CFG.heat, tDetect: CFG.detectors,
     tBuild: CFG.buildings, tLights: CFG.headlights, tTrails: CFG.trails,
-    tShadows: CFG.shadows, tTrees: CFG.trees, tXray: CFG.xray,
+    tShadows: CFG.shadows, tTrees: CFG.trees, tXray: CFG.xray, tDynRes: DYNRES.enabled, tSound: AUDIO.on,
   };
   for (const k in togs){ const el = $(k); if (el) el.checked = togs[k]; }
 }
@@ -8020,6 +9797,12 @@ function setupPointer(){
   cv.addEventListener('pointerdown', e => {
     if (cv.setPointerCapture) try { cv.setPointerCapture(e.pointerId); } catch (err) {}
     if (e.pointerType === 'mouse') e.preventDefault();
+    /* Cancelling the press also cancels the focus change a click on
+       the page would make, so the last panel button stayed focused:
+       Enter while drawing then pressed it again — "Empty canvas" wiped
+       the network.  Hand the keyboard back to the page. */
+    const ae = document.activeElement;
+    if (ae && ae !== document.body && ae.blur) ae.blur();
     const sel = window.getSelection && window.getSelection();
     if (sel && sel.rangeCount) sel.removeAllRanges();
     const s = localXY(e);
@@ -8043,7 +9826,21 @@ function setupPointer(){
     cv.classList.add('dragging');
   });
 
+  /* A release made outside the window, or while it was in the
+     background, never arrives here, and a drag left running had the
+     junction follow the pointer with no button held.  A mouse moving
+     with no button down finishes the gesture where it was left; losing
+     the window mid-gesture abandons it, as Escape would. */
+  const endLostDrag = commit => {
+    const d = drag;
+    drag = null; pinch = null; PTRS.clear();
+    cv.classList.remove('dragging');
+    if (d && d.mode === 'edit'){ if (commit) editorUp(d.last, null); else editorAbort(); }
+  };
+  window.addEventListener('blur', () => { if (drag || pinch) endLostDrag(false); });
+
   cv.addEventListener('pointermove', e => {
+    if (drag && e.pointerType === 'mouse' && e.buttons === 0) endLostDrag(true);
     const s = localXY(e);
     if (PTRS.has(e.pointerId)) PTRS.set(e.pointerId, s);
     if (pinch){ if (PTRS.size >= 2) movePinch(); return; }
@@ -8155,6 +9952,7 @@ function setupPointer(){
     else if (k === 'z' && (e.metaKey || e.ctrlKey)){ e.preventDefault(); e.shiftKey ? doRedo() : doUndo(); }
     else if (k === 'y' && (e.metaKey || e.ctrlKey)){ e.preventDefault(); doRedo(); }
     else if (k === 'h'){ CFG.heat = !CFG.heat; $('tHeat').checked = CFG.heat; }
+    else if (k === 'm'){ setSound(!AUDIO.on); $('tSound').checked = AUDIO.on; toast(AUDIO.on ? 'Sound on' : 'Sound off'); }
     else if (k === 'q') rotateView(-Math.PI / 4);
     else if (k === 'e') rotateView(Math.PI / 4);
     else if (k === 't') togglePlanView();
@@ -8618,9 +10416,16 @@ function buildLayoutList(){
   });
 }
 
+/* the network as last loaded or exported, to tell whether edits
+   would be lost by leaving the page or loading over them */
+let cleanPlan = '';
+function markPlanClean(){ cleanPlan = JSON.stringify(planToJSON()); }
+function planDirty(){ return !!cleanPlan && JSON.stringify(planToJSON()) !== cleanPlan; }
+
 function applyLayout(id){
   const L = LAYOUTS.find(l => l.id === id);
   if (!L) return;
+  const edited = planDirty();
   snapshot();
   for (const v of SIM.vehicles.slice()) despawn(v, false);
   SIM.vehicles.length = 0; SIM.peds.length = 0;
@@ -8630,7 +10435,8 @@ function applyLayout(id){
   recompile('layout');
   freeRun();
   fitView();
-  toast(`${L.name} loaded`);
+  markPlanClean();
+  toast(edited ? `${L.name} loaded — Ctrl+Z brings back your network` : `${L.name} loaded`);
 }
 
 function paintHistoryButtons(){
@@ -8660,6 +10466,7 @@ function exportPlan(){
   a.href = URL.createObjectURL(blob);
   a.download = 'network.json';
   a.click();
+  markPlanClean();
   setTimeout(() => URL.revokeObjectURL(a.href), 2000);
   toast('Network exported');
 }
@@ -8678,6 +10485,7 @@ function importPlan(file){
     SIM.vehicles.length = 0;
     recompile('import');
     freeRun(); fitView();
+    markPlanClean();
     toast(skipped ? `Network imported — ${skipped} broken road${skipped > 1 ? 's' : ''} left out` : 'Network imported');
   };
   fr.readAsText(file);
@@ -8699,6 +10507,13 @@ function buildLegend(){
 
 /* ============================================================
    9 · MAIN LOOP
+
+   The simulation runs on this thread, between frames.  On the
+   gridlock stress test (some 300 vehicles) a step costs about a
+   quarter of a millisecond and the fastest speed takes three a
+   frame; the scene update adds about one more.  A worker would
+   save under a millisecond a frame and cost a copy of every
+   vehicle across to the renderer each frame, so it stays here.
    ============================================================ */
 let cityBuiltAt = 0;
 let acc = 0, lastT = 0, fpsAcc = 0, fpsN = 0, statTimer = 0, histTimer = 0, vmsTimer = 0;
@@ -8706,13 +10521,24 @@ let acc = 0, lastT = 0, fpsAcc = 0, fpsN = 0, statTimer = 0, histTimer = 0, vmsT
 /* One bad frame must not be able to freeze the whole console:
    requestAnimationFrame is re-armed before any work happens, and
    a throw is reported once rather than silently killing the loop. */
-let frameFaults = 0;
+let frameFaults = 0, faultNoticeAt = -1e9;
 function frame(now){
   requestAnimationFrame(frame);
-  try { frameBody(now); }
+  const t0 = performance.now();
+  try { frameBody(now); dynResSample(now, performance.now() - t0); }
   catch (err){
     frameFaults++;
-    if (frameFaults === 1){
+    /* A fault usually comes from something that has just gone stale —
+       a selected road deleted, a followed car removed — and would
+       recur identically every frame, leaving the view frozen.  Drop
+       that transient state so the next frame can draw again. */
+    try {
+      SIM.selected = null; SIM.follow = false; CAM.chase = false;
+      ED.hoverNode = null; ED.hoverEdge = null;
+      renderInspector();
+    } catch (e) {}
+    if (now - faultNoticeAt > 8000){
+      faultNoticeAt = now;
       console.error('Render fault:', err);
       try { toast('A rendering fault was caught — see the console'); } catch (e) {}
     }
@@ -8782,6 +10608,7 @@ function frameBody(now){
   } else cityDirtySince = 0;
 
   draw(dtReal);
+  updateAudio(now);
 
   statTimer -= dtReal;
   if (statTimer <= 0){
@@ -8840,6 +10667,7 @@ function boot(){
   applyCam();
 
   applyScenario('am');
+  markPlanClean();
 
   /* pre-load the network so the opening frame is not empty */
   for (let i = 0; i < 1400; i++) stepSim(0.05);
@@ -8863,7 +10691,7 @@ function boot(){
 window.GRID3D = {
   SIM, CFG, NET, PLAN, CAM, ED, STAT, HIST, REBUILD, COMPILE, renderer, scene, camera,
   applyCam, screenToWorld, worldToScreen, recompile, fitView, setTool, applyLayout, applyScenario,
-  stepSim, buildStatic, buildCity, togglePlanView, rotateView, zoomBy, resetTraffic, undo, redo,
+  stepSim, buildStatic, buildCity, togglePlanView, setQuality, get Q(){ return Q; }, rotateView, zoomBy, resetTraffic, undo, redo,
   editorDown, editorMove, editorUp, editorCancel, setEdgeProp, setNodeProp,
   perfProbe(n){
     /* JS cost of one frame's scene update, without the GPU render */
