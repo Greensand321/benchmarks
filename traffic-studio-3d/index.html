@@ -613,6 +613,12 @@ body.editing #view{cursor:crosshair}
         <div class="sect-h"><span class="eyebrow">Display</span><span class="chev">▾</span></div>
         <div class="sect-b">
           <div class="ctl">
+            <div class="ctl-top"><label>Graphics quality</label><span class="val" id="vQuality">Auto</span></div>
+            <div class="seg" id="qualitySeg">
+              <button data-q="auto">Auto</button><button data-q="low">Low</button><button data-q="medium">Med</button><button data-q="high">High</button><button data-q="ultra">Ultra</button>
+            </div>
+          </div>
+          <div class="ctl">
             <div class="ctl-top"><label>Colour vehicles by</label></div>
             <div class="seg" id="colorSeg">
               <button data-cm="type" class="on">Type</button><button data-cm="speed">Speed</button><button data-cm="delay">Delay</button>
@@ -4289,7 +4295,7 @@ function pxPerMetre(wx, wy, h){
 }
 
 function resize(){
-  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  DPR = Math.min(window.devicePixelRatio || 1, Q.dprMax);
   const r = cv.getBoundingClientRect();
   VW = Math.max(1, r.width); VH = Math.max(1, r.height);
   renderer.setPixelRatio(DPR);
@@ -4967,6 +4973,88 @@ const GEO_FLAT = new THREE.PlaneGeometry(1, 1).rotateX(-Math.PI / 2);           
 const GEO_DISC = new THREE.CylinderGeometry(0.5, 0.5, 1, 16).rotateZ(Math.PI / 2);     // lens facing ±x
 
 /* ------------------------------------------------------------
+   Graphics quality
+
+   Every graphics feature reads its settings from Q, the active
+   preset, so a single switch trades looks for speed.  "Auto" picks
+   a preset from what the device says about itself; an explicit
+   choice is remembered per browser.  Features that need to rebuild
+   something when the preset changes register a hook.
+   ------------------------------------------------------------ */
+const QUALITY_LEVELS = ['low', 'medium', 'high', 'ultra'];
+const QUALITY = {
+  low:    { name: 'Low',    dprMax: 1,   shadowSize: 1024 },
+  medium: { name: 'Medium', dprMax: 1.5, shadowSize: 2048 },
+  high:   { name: 'High',   dprMax: 2,   shadowSize: 2048 },
+  ultra:  { name: 'Ultra',  dprMax: 2,   shadowSize: 4096 },
+};
+const QUALITY_HOOKS = [];
+let qualityChoice = 'auto';
+let qualityAuto = 'medium';
+let Q = QUALITY.medium;
+
+/* What the device can probably sustain.  Coarse on purpose — the
+   dynamic resolution fine-tunes from there — and never Ultra, which
+   is for someone who asks for it. */
+function detectQuality(){
+  let gpu = '';
+  try {
+    const gl = renderer.getContext();
+    const ext = gl.getExtension('WEBGL_debug_renderer_info');
+    gpu = String(ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER) || '');
+  } catch (e) {}
+  const g = gpu.toLowerCase();
+  const coarse = !!(window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
+  const mem = navigator.deviceMemory || 8, cores = navigator.hardwareConcurrency || 4;
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const px = (screen.width || 1920) * (screen.height || 1080) * dpr * dpr;
+  if (/swiftshader|llvmpipe|softpipe|software|basic render/.test(g)) return 'low';
+  if (mem <= 2 || cores <= 2) return 'low';
+  if (coarse) return /apple gpu|adreno.*(7[3-9]\d|8\d\d)|mali-g(7[1-9]|[89]\d\d)|xclipse/.test(g) ? 'medium' : 'low';
+  if (/nvidia|geforce|rtx|gtx|quadro|radeon rx|radeon pro|arc\(tm\) a|arc a\d|apple m\d|apple gpu/.test(g)) return 'high';
+  if (/intel|iris|uhd|hd graphics|radeon\(tm\) graphics|radeon graphics|vega/.test(g)) return px > 5e6 ? 'low' : 'medium';
+  return 'medium';
+}
+
+function loadQualityChoice(){
+  try {
+    const v = localStorage.getItem('gridcontrol.quality');
+    if (v === 'auto' || QUALITY_LEVELS.includes(v)) return v;
+  } catch (e) {}
+  return 'auto';
+}
+
+/* switch preset; `choice` is 'auto' or a level */
+function setQuality(choice, save){
+  qualityChoice = choice === 'auto' || QUALITY_LEVELS.includes(choice) ? choice : 'auto';
+  const level = qualityChoice === 'auto' ? qualityAuto : qualityChoice;
+  Q = QUALITY[level];
+  Q.level = level;
+  if (save !== false){ try { localStorage.setItem('gridcontrol.quality', qualityChoice); } catch (e) {} }
+  if (typeof resize === 'function' && VW > 1) resize();
+  /* a new shadow map size takes effect when the old map is dropped */
+  if (typeof sun !== 'undefined' && sun.shadow.mapSize.x !== Q.shadowSize){
+    sun.shadow.mapSize.set(Q.shadowSize, Q.shadowSize);
+    if (sun.shadow.map){ sun.shadow.map.dispose(); sun.shadow.map = null; }
+  }
+  for (const f of QUALITY_HOOKS) f(Q);
+  paintQualityControl();
+}
+
+function paintQualityControl(){
+  const seg = document.getElementById('qualitySeg');
+  if (!seg) return;
+  seg.querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.q === qualityChoice));
+  const v = document.getElementById('vQuality');
+  if (v) v.textContent = qualityChoice === 'auto' ? `Auto · ${QUALITY[qualityAuto].name}` : QUALITY[qualityChoice].name;
+}
+
+qualityAuto = detectQuality();
+qualityChoice = loadQualityChoice();
+Q = QUALITY[qualityChoice === 'auto' ? qualityAuto : qualityChoice];
+Q.level = qualityChoice === 'auto' ? qualityAuto : qualityChoice;
+
+/* ------------------------------------------------------------
    Environment: sky, sun and moon, fog, ground
 
    Darkness still comes from nightF(), exactly as in 2D, so the
@@ -4977,7 +5065,7 @@ const hemi = new THREE.HemisphereLight(0xc9d7e8, 0x4a4740, 1.1);
 scene.add(hemi);
 const sun = new THREE.DirectionalLight(0xfff3e0, 2.4);
 sun.castShadow = true;
-sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.mapSize.set(Q.shadowSize, Q.shadowSize);
 sun.shadow.bias = -0.0002;
 scene.add(sun, sun.target);
 scene.fog = new THREE.Fog(0x9aabbd, 1500, 6000);
@@ -7838,6 +7926,14 @@ function setupControls(){
   bindTog('tLights', v => CFG.headlights = v);
   bindTog('tTrails', v => { CFG.trails = v; if (!v) for (const x of SIM.vehicles) x.trail.length = 0; });
 
+  document.querySelectorAll('#qualitySeg button').forEach(b => {
+    b.addEventListener('click', () => {
+      setQuality(b.dataset.q);
+      toast(`Graphics: ${qualityChoice === 'auto' ? 'Auto (' + QUALITY[qualityAuto].name + ')' : Q.name}`);
+    });
+  });
+  paintQualityControl();
+
   document.querySelectorAll('#colorSeg button').forEach(b => {
     b.addEventListener('click', () => {
       CFG.colorMode = b.dataset.cm;
@@ -8947,7 +9043,7 @@ function boot(){
 window.GRID3D = {
   SIM, CFG, NET, PLAN, CAM, ED, STAT, HIST, REBUILD, COMPILE, renderer, scene, camera,
   applyCam, screenToWorld, worldToScreen, recompile, fitView, setTool, applyLayout, applyScenario,
-  stepSim, buildStatic, buildCity, togglePlanView, rotateView, zoomBy, resetTraffic, undo, redo,
+  stepSim, buildStatic, buildCity, togglePlanView, setQuality, get Q(){ return Q; }, rotateView, zoomBy, resetTraffic, undo, redo,
   editorDown, editorMove, editorUp, editorCancel, setEdgeProp, setNodeProp,
   perfProbe(n){
     /* JS cost of one frame's scene update, without the GPU render */
