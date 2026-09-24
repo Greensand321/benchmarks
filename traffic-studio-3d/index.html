@@ -5010,10 +5010,10 @@ const GEO_DISC = new THREE.CylinderGeometry(0.5, 0.5, 1, 16).rotateZ(Math.PI / 2
    ------------------------------------------------------------ */
 const QUALITY_LEVELS = ['low', 'medium', 'high', 'ultra'];
 const QUALITY = {
-  low:    { name: 'Low',    dprMax: 1,   shadowSize: 1024, post: false, msaa: 0, cloudShadows: false, ibl: false, bloom: 0, ao: 0 },
-  medium: { name: 'Medium', dprMax: 1.5, shadowSize: 2048, post: true,  msaa: 2, cloudShadows: true, ibl: true, bloom: 5, ao: 8 },
-  high:   { name: 'High',   dprMax: 2,   shadowSize: 2048, post: true,  msaa: 4, cloudShadows: true, ibl: true, bloom: 6, ao: 12 },
-  ultra:  { name: 'Ultra',  dprMax: 2,   shadowSize: 4096, post: true,  msaa: 4, cloudShadows: true, ibl: true, bloom: 7, ao: 16 },
+  low:    { name: 'Low',    dprMax: 1,   shadowSize: 1024, shadowFarSize: 1024, cascades: 1, post: false, msaa: 0, cloudShadows: false, ibl: false, bloom: 0, ao: 0 },
+  medium: { name: 'Medium', dprMax: 1.5, shadowSize: 2048, shadowFarSize: 1024, cascades: 2, post: true,  msaa: 2, cloudShadows: true, ibl: true, bloom: 5, ao: 8 },
+  high:   { name: 'High',   dprMax: 2,   shadowSize: 2048, shadowFarSize: 2048, cascades: 2, post: true,  msaa: 4, cloudShadows: true, ibl: true, bloom: 6, ao: 12 },
+  ultra:  { name: 'Ultra',  dprMax: 2,   shadowSize: 4096, shadowFarSize: 2048, cascades: 2, post: true,  msaa: 4, cloudShadows: true, ibl: true, bloom: 7, ao: 16 },
 };
 const QUALITY_HOOKS = [];
 let qualityChoice = 'auto';
@@ -5064,6 +5064,10 @@ function setQuality(choice, save){
     sun.shadow.mapSize.set(Q.shadowSize, Q.shadowSize);
     if (sun.shadow.map){ sun.shadow.map.dispose(); sun.shadow.map = null; }
   }
+  if (typeof sunFar !== 'undefined' && sunFar.shadow.mapSize.x !== Q.shadowFarSize){
+    sunFar.shadow.mapSize.set(Q.shadowFarSize, Q.shadowFarSize);
+    if (sunFar.shadow.map){ sunFar.shadow.map.dispose(); sunFar.shadow.map = null; }
+  }
   for (const f of QUALITY_HOOKS) f(Q);
   paintQualityControl();
 }
@@ -5104,6 +5108,17 @@ sun.castShadow = true;
 sun.shadow.mapSize.set(Q.shadowSize, Q.shadowSize);
 sun.shadow.bias = -0.0002;
 scene.add(sun, sun.target);
+/* The sun's shadow comes in two cascades: the map above covers what
+   is near the view's centre in fine detail, this one a wider area
+   ahead, coarser, so a view along a street still sees buildings far
+   off cast shadows.  This light gives no light of its own — the lit
+   shaders take only its shadow map (see CSM_BLOCK). */
+const sunFar = new THREE.DirectionalLight(0xffffff, 0);
+sunFar.castShadow = true;
+sunFar.shadow.mapSize.set(Q.shadowFarSize || 1024, Q.shadowFarSize || 1024);
+sunFar.shadow.bias = -0.0003;
+sunFar.visible = false;
+scene.add(sunFar, sunFar.target);
 
 const ENV = {
   moon: C3('#94abdc'), moonDisc: C3('#dfe7f5'),
@@ -5361,13 +5376,47 @@ const ATM_VERT = `#include <project_vertex>
     vAtmW = (modelMatrix * aw).xyz;
   }`;
 const ATM_DIR_HOOK = 'getDirectionalLightInfo( directionalLight, directLight );';
+const CSM_FROM = '#if ( NUM_DIR_LIGHTS > 0 ) && defined( RE_Direct )';
+const CSM_TO = '#if ( NUM_RECT_AREA_LIGHTS > 0 ) && defined( RE_Direct_RectArea )';
+const CSM_BLOCK = `#if ( NUM_DIR_LIGHTS > 0 ) && defined( RE_Direct )
+	DirectionalLight directionalLight = directionalLights[ 0 ];
+	getDirectionalLightInfo( directionalLight, directLight );
+	directLight.color *= atmCS;
+	#if defined( USE_SHADOWMAP ) && NUM_DIR_LIGHT_SHADOWS > 0
+	if ( directLight.visible && receiveShadow ) {
+		DirectionalLightShadow sn = directionalLightShadows[ 0 ];
+		float sh = getShadow( directionalShadowMap[ 0 ], sn.shadowMapSize, sn.shadowIntensity, sn.shadowBias, sn.shadowRadius, vDirectionalShadowCoord[ 0 ] );
+		#if NUM_DIR_LIGHT_SHADOWS > 1
+		vec2 cn = vDirectionalShadowCoord[ 0 ].xy / vDirectionalShadowCoord[ 0 ].w;
+		vec2 en = min( cn, 1.0 - cn );
+		float inNear = smoothstep( 0.0, 0.08, min( en.x, en.y ) );
+		if ( inNear < 1.0 ) {
+			DirectionalLightShadow sf = directionalLightShadows[ 1 ];
+			sh = mix( getShadow( directionalShadowMap[ 1 ], sf.shadowMapSize, sf.shadowIntensity, sf.shadowBias, sf.shadowRadius, vDirectionalShadowCoord[ 1 ] ), sh, inNear );
+		}
+		#endif
+		directLight.color *= sh;
+	}
+	#endif
+	RE_Direct( directLight, geometryPosition, geometryNormal, geometryViewDir, geometryClearcoatNormal, material, reflectedLight );
+#endif
+`;
+/* the stock chunk as expected: the cascade split can replace its sun */
+const CSM_OK = (() => {
+  const lb = THREE.ShaderChunk.lights_fragment_begin, a = lb.indexOf(CSM_FROM), b = lb.indexOf(CSM_TO);
+  return a >= 0 && b > a;
+})();
 function atmospherePatch(mat, mode){
   return shaderPatch(mat, 'atm-' + mode, sh => {
     Object.assign(sh.uniforms, ATMU);
     sh.vertexShader = 'varying vec3 vAtmW;\n' + sh.vertexShader.replace('#include <project_vertex>', ATM_VERT);
     let fs = sh.fragmentShader;
     const lb = THREE.ShaderChunk.lights_fragment_begin;
-    if (mode === 'lit' && lb.includes(ATM_DIR_HOOK))
+    if (mode === 'lit' && CSM_OK){
+      const a = lb.indexOf(CSM_FROM), b = lb.indexOf(CSM_TO);
+      fs = fs.replace('#include <lights_fragment_begin>', 'float atmCS = atmCloudShadow(vAtmW);\n'
+        + lb.slice(0, a) + CSM_BLOCK + lb.slice(b));
+    } else if (mode === 'lit' && lb.includes(ATM_DIR_HOOK))
       fs = fs.replace('#include <lights_fragment_begin>', 'float atmCS = atmCloudShadow(vAtmW);\n'
         + lb.replace(ATM_DIR_HOOK, ATM_DIR_HOOK + '\n\t\tdirectLight.color *= atmCS;'));
     /* the captured sky is used for reflections only, and only where the
@@ -5989,8 +6038,9 @@ function updateEnvironment(dtReal){
 const _lx = new THREE.Vector3(), _ly = new THREE.Vector3(), _lz = new THREE.Vector3(), _lc = new THREE.Vector3();
 function fitShadow(){
   sun.castShadow = CFG.shadows;
-  if (!CFG.shadows) return;
-  const s = clamp(CAM.dist * 0.72 + 30, 60, 1500);
+  if (!CFG.shadows){ sunFar.visible = false; return; }
+  /* with a far cascade behind it, the near one can be tighter and sharper */
+  const s = CSM_OK && (Q.cascades || 1) > 1 ? clamp(CAM.dist * 0.55 + 25, 45, 1200) : clamp(CAM.dist * 0.72 + 30, 60, 1500);
   const sc = sun.shadow.camera;
   const size = sun.shadow.mapSize.x;
   const fwd = Math.cos(CAM.pitch) * CAM.dist * 0.28;
@@ -6013,6 +6063,35 @@ function fitShadow(){
   }
   sun.shadow.normalBias = texel * 0.8;
   sun.target.updateMatrixWorld();
+  fitShadowFar(dir);
+}
+
+/* the far cascade: a wider square pushed out along the view, so a
+   low view down a street has shadows out toward the horizon */
+function fitShadowFar(dir){
+  sunFar.visible = !!(CSM_OK && CFG.shadows && (Q.cascades || 1) > 1);
+  if (!sunFar.visible) return;
+  const s = clamp(CAM.dist * 2.2 + 500, 600, 3500);
+  const sc = sunFar.shadow.camera, size = sunFar.shadow.mapSize.x;
+  const fwd = Math.cos(CAM.pitch) * s * 0.6;
+  _lc.set(CAM.x - Math.sin(CAM.yaw) * fwd, 0, CAM.y - Math.cos(CAM.yaw) * fwd);
+  _lz.copy(dir);
+  _lx.set(0, 1, 0).cross(_lz).normalize();
+  _ly.copy(_lz).cross(_lx);
+  const texel = 2 * s / size;
+  const px = _lc.dot(_lx), py = _lc.dot(_ly);
+  _lc.addScaledVector(_lx, Math.round(px / texel) * texel - px);
+  _lc.addScaledVector(_ly, Math.round(py / texel) * texel - py);
+  const far = 2 * s + 800;
+  sunFar.target.position.copy(_lc);
+  sunFar.position.copy(_lc).addScaledVector(dir, far * 0.5);
+  if (sc.right !== s || sc.far !== far){
+    sc.left = -s; sc.right = s; sc.top = s; sc.bottom = -s;
+    sc.near = 1; sc.far = far;
+    sc.updateProjectionMatrix();
+  }
+  sunFar.shadow.normalBias = texel * 0.8;
+  sunFar.target.updateMatrixWorld();
 }
 
 /* ------------------------------------------------------------
@@ -6031,6 +6110,7 @@ function toOverlay(o){ o.layers.set(LAYER_OVERLAY); return o; }
 /* layers gate lights as well as meshes: both passes need them */
 hemi.layers.enable(LAYER_OVERLAY);
 sun.layers.enable(LAYER_OVERLAY);
+sunFar.layers.enable(LAYER_OVERLAY);
 /* the shadow map is drawn once per frame, not once per pass */
 renderer.shadowMap.autoUpdate = false;
 renderer.info.autoReset = false;
@@ -6421,7 +6501,7 @@ cv.addEventListener('webglcontextrestored', () => {
   POST.rt = null; POST.w = POST.h = 0; POST.samples = -1;
   BLOOM.levels.length = 0; BLOOM.w = BLOOM.h = BLOOM.n = 0;
   AO.a = AO.b = null; AO.w = AO.h = 0;
-  sun.shadow.map = null;
+  sun.shadow.map = null; sunFar.shadow.map = null;
 });
 toOverlay(surveyGrid);
 toOverlay(snapGrid);
