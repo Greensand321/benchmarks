@@ -1,0 +1,135 @@
+{
+  "when": "2026-09-24T23:23:31.240Z",
+  "grid": 100,
+  "seed": 1,
+  "machine": {
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "cores": 4,
+    "memGB": 16,
+    "platform": "linux 6.18.44-fc-v37",
+    "node": "v22.22.2"
+  },
+  "rows": [
+    {
+      "engine": "js",
+      "agents": 1000,
+      "events": 133736,
+      "eventsPerAgentDay": 133.7,
+      "ms": 40,
+      "mEventsPerSec": 3.3,
+      "speedVs1x": 35905.5,
+      "hash": "b68d74ea"
+    },
+    {
+      "engine": "wasm",
+      "agents": 1000,
+      "events": 133736,
+      "eventsPerAgentDay": 133.7,
+      "ms": 17,
+      "mEventsPerSec": 7.9,
+      "speedVs1x": 84534.6,
+      "hash": "b68d74ea"
+    },
+    {
+      "engine": "rust-native",
+      "agents": 1000,
+      "events": 133736,
+      "eventsPerAgentDay": 133.7,
+      "ms": 9,
+      "mEventsPerSec": 14.9,
+      "speedVs1x": 160000,
+      "hash": "b68d74ea"
+    },
+    {
+      "engine": "js",
+      "agents": 10000,
+      "events": 1331109,
+      "eventsPerAgentDay": 133.1,
+      "ms": 232,
+      "mEventsPerSec": 5.7,
+      "speedVs1x": 6197,
+      "hash": "86e42ce1"
+    },
+    {
+      "engine": "wasm",
+      "agents": 10000,
+      "events": 1331109,
+      "eventsPerAgentDay": 133.1,
+      "ms": 124,
+      "mEventsPerSec": 10.8,
+      "speedVs1x": 11636.9,
+      "hash": "86e42ce1"
+    },
+    {
+      "engine": "rust-native",
+      "agents": 10000,
+      "events": 1331109,
+      "eventsPerAgentDay": 133.1,
+      "ms": 119,
+      "mEventsPerSec": 11.2,
+      "speedVs1x": 12080.5,
+      "hash": "86e42ce1"
+    },
+    {
+      "engine": "js",
+      "agents": 100000,
+      "events": 13508783,
+      "eventsPerAgentDay": 135.1,
+      "ms": 2906,
+      "mEventsPerSec": 4.6,
+      "speedVs1x": 495.5,
+      "hash": "3581773e"
+    },
+    {
+      "engine": "wasm",
+      "agents": 100000,
+      "events": 13508783,
+      "eventsPerAgentDay": 135.1,
+      "ms": 1818,
+      "mEventsPerSec": 7.4,
+      "speedVs1x": 792.2,
+      "hash": "3581773e"
+    },
+    {
+      "engine": "rust-native",
+      "agents": 100000,
+      "events": 13508783,
+      "eventsPerAgentDay": 135.1,
+      "ms": 1741,
+      "mEventsPerSec": 7.8,
+      "speedVs1x": 827.1,
+      "hash": "3581773e"
+    },
+    {
+      "engine": "js",
+      "agents": 1000000,
+      "events": 136598532,
+      "eventsPerAgentDay": 136.6,
+      "ms": 39039,
+      "mEventsPerSec": 3.5,
+      "speedVs1x": 36.9,
+      "hash": "e359cba4"
+    },
+    {
+      "engine": "wasm",
+      "agents": 1000000,
+      "events": 136598532,
+      "eventsPerAgentDay": 136.6,
+      "ms": 26005,
+      "mEventsPerSec": 5.3,
+      "speedVs1x": 55.4,
+      "hash": "e359cba4"
+    },
+    {
+      "engine": "rust-native",
+      "agents": 1000000,
+      "events": 136598532,
+      "eventsPerAgentDay": 136.6,
+      "ms": 23856,
+      "mEventsPerSec": 5.7,
+      "speedVs1x": 60.4,
+      "hash": "e359cba4"
+    }
+  ],
+  "enginesAgree": true
+}
