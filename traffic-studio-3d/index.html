@@ -10244,6 +10244,13 @@ function buildLegend(){
 
 /* ============================================================
    9 · MAIN LOOP
+
+   The simulation runs on this thread, between frames.  On the
+   gridlock stress test (some 300 vehicles) a step costs about a
+   quarter of a millisecond and the fastest speed takes three a
+   frame; the scene update adds about one more.  A worker would
+   save under a millisecond a frame and cost a copy of every
+   vehicle across to the renderer each frame, so it stays here.
    ============================================================ */
 let cityBuiltAt = 0;
 let acc = 0, lastT = 0, fpsAcc = 0, fpsN = 0, statTimer = 0, histTimer = 0, vmsTimer = 0;
