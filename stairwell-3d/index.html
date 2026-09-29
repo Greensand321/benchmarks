@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Stair B – three floors</title>
+<title>Stair B Stairwell</title>
 <style>
   :root { color-scheme: dark; --fg:#e9e7e1; --dim:#a9a69c; --panel:rgba(20,20,22,.78); --line:rgba(255,255,255,.14); --accent:#f0b017; }
   * { box-sizing: border-box; }
@@ -22,6 +22,10 @@
   #help b { color:var(--fg); font-weight:600; }
   #loading { position:fixed; inset:0; display:grid; place-items:center; background:#111; color:var(--dim); z-index:5; }
   #loading.hide { display:none; }
+  @media (max-width: 600px) {
+    #ui { left: 16px; top: 16px; width: auto; max-width: min(250px, calc(100vw - 32px)); max-height: 46vh; overflow: auto; }
+    #help { left: 16px; right: 16px; bottom: 16px; max-width: none; }
+  }
   #err { position:fixed; inset:0; display:none; place-items:center; background:#111; color:#f5b7b1; padding:24px; text-align:center; z-index:6; }
 </style>
 <script type="importmap">
